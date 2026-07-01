@@ -20,27 +20,29 @@ regardless of which framework built the calling agent — which is the
 difference between "our agent has guardrails" and "TruClaw governs the
 fleet."
 
-Design (see README.md for the full writeup):
+Design (see docs/ARCHITECTURE.md for the full writeup):
   1. Parse identity + tool call out of the Gateway event.
-  2. Run the same four-path decision truclaw_adk always ran (danger.check_danger).
+  2. Run the same four-path decision the original implementation always ran
+     (danger.check_danger).
   3. ALLOW / DENY resolve immediately — this is the common case and stays
      synchronous and cheap.
-  4. ESCALATE hands off to a short Step Functions Express *synchronous*
-     execution (see statemachine/escalation.asl.json) that sends the human
-     challenge and waits on a task token, bounded by
-     TRUCLAW_CHALLENGE_TIMEOUT_SECONDS. That keeps the wait state in Step
-     Functions (durable, externally resumable by resume_handler.py) instead
-     of an in-process dict + polling thread, without requiring the Gateway
-     itself to support pausing/resuming a call — from the Gateway's point of
-     view this interceptor just took a bit longer and returned a normal
-     decision.
+  4. ESCALATE hands off to a Step Functions STANDARD state machine (see
+     statemachine/escalation.asl.json) that sends the human challenge and
+     waits on a task token, bounded by TRUCLAW_CHALLENGE_TIMEOUT_SECONDS.
+     Standard, not Express: Express workflows don't support
+     .waitForTaskToken at all, which was discovered via a failed deploy —
+     see _escalate()'s docstring below for the resulting poll-based design.
+     Either way, the wait state lives in Step Functions (durable, externally
+     resumable by resume_handler.py) instead of an in-process dict + polling
+     thread, without requiring the Gateway itself to support
+     pausing/resuming a call — from the Gateway's point of view this
+     interceptor just took a bit longer and returned a normal decision.
 
-     NOTE: this bounded-synchronous-wait approach is the right fit as long
-     as challenge timeouts stay short (today's default: 120s, well under
-     Express Sync's ~5 minute execution cap). If the V1 on-call/escalation
-     chain routing we discussed ever needs a longer SLA than that, this
-     needs to move to a fully async "return pending, caller retries" model
-     instead — flagged in README.md as a known follow-up, not solved here.
+     NOTE: this bounded-wait approach is the right fit as long as challenge
+     timeouts stay short (today's default: 120s). If the on-call/escalation
+     chain routing discussed as a follow-up ever needs a longer SLA than
+     that, this needs to move to a fully async "return pending, caller
+     retries" model instead — see docs/ARCHITECTURE.md, not solved here.
 """
 import asyncio
 import json
@@ -112,7 +114,7 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         log(f"[interceptor] dangerous but TRUCLAW_ENFORCE=0, allowing tool={tool_name}")
         return _gateway_response("ALLOW")
 
-    # ESCALATE — bounded synchronous wait via Step Functions Express Sync.
+    # ESCALATE — bounded wait via a Step Functions STANDARD execution, polled.
     approval = _escalate(decision, tool_name, tool_args, agent_id, user_id)
 
     if approval.get("approved"):
@@ -131,8 +133,21 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 def _escalate(
     decision: Dict[str, Any], tool_name: str, tool_args: Any, agent_id: str, user_id: str
 ) -> Dict[str, Any]:
-    """Starts the escalation state machine synchronously and waits (bounded
-    by CHALLENGE_TIMEOUT_SECONDS + a small margin) for it to resolve."""
+    """Starts the escalation state machine and waits (bounded by
+    CHALLENGE_TIMEOUT_SECONDS + a small margin) for it to resolve.
+
+    This is a STANDARD state machine, not Express -- Express workflows
+    (including Express Sync) don't support the .waitForTaskToken pattern the
+    escalation flow depends on, which is a hard AWS platform limitation
+    discovered via an actual failed deploy, not a design choice. Standard
+    has no StartSyncExecution API, so instead of blocking on one synchronous
+    call, this starts the execution and polls DescribeExecution in a short
+    loop until it resolves or the deadline passes. Still synchronous from
+    the caller's (Gateway's) point of view -- this function doesn't return
+    until it has an answer or gives up -- just implemented as a poll against
+    Step Functions' own durable execution state instead of a single blocking
+    API call. See infra/cdk/truclaw_stack.py for the IAM side of this.
+    """
     import boto3
 
     if not config.ESCALATION_STATE_MACHINE_ARN:
@@ -152,7 +167,7 @@ def _escalate(
     }
 
     try:
-        resp = client.start_sync_execution(
+        resp = client.start_execution(
             stateMachineArn=config.ESCALATION_STATE_MACHINE_ARN,
             name=f"escalation-{int(time.time() * 1000)}",
             input=json.dumps(payload),
@@ -161,12 +176,34 @@ def _escalate(
         log(f"[interceptor] failed to start escalation workflow: {e}")
         return {"approved": False, "reason": f"escalation start failed: {e}"}
 
-    if resp.get("status") != "SUCCEEDED":
-        log(f"[interceptor] escalation workflow did not succeed: {resp.get('status')} {resp.get('error')}")
-        return {"approved": False, "reason": resp.get("error") or "escalation workflow failed"}
+    execution_arn = resp["executionArn"]
+    poll_interval_seconds = 2
+    deadline = time.time() + config.CHALLENGE_TIMEOUT_SECONDS + 10  # small margin over the state machine's own task timeout
 
+    while time.time() < deadline:
+        try:
+            desc = client.describe_execution(executionArn=execution_arn)
+        except Exception as e:
+            log(f"[interceptor] describe_execution error: {e}")
+            time.sleep(poll_interval_seconds)
+            continue
+
+        status = desc.get("status")
+        if status == "SUCCEEDED":
+            try:
+                return json.loads(desc["output"])
+            except Exception as e:
+                log(f"[interceptor] could not parse escalation output: {e}")
+                return {"approved": False, "reason": "unparseable escalation result"}
+        if status in ("FAILED", "TIMED_OUT", "ABORTED"):
+            log(f"[interceptor] escalation workflow ended status={status}")
+            return {"approved": False, "reason": f"escalation workflow {status.lower()}"}
+        # RUNNING -- keep polling
+        time.sleep(poll_interval_seconds)
+
+    log(f"[interceptor] escalation poll deadline reached, stopping execution {execution_arn}")
     try:
-        return json.loads(resp["output"])
+        client.stop_execution(executionArn=execution_arn, cause="TruClaw interceptor poll timeout")
     except Exception as e:
-        log(f"[interceptor] could not parse escalation output: {e}")
-        return {"approved": False, "reason": "unparseable escalation result"}
+        log(f"[interceptor] stop_execution error (non-fatal): {e}")
+    return {"approved": False, "reason": "escalation timed out"}

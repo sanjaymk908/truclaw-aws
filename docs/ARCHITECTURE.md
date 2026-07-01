@@ -61,21 +61,37 @@ to race there.
 
 Common case (allow/deny) stays synchronous and cheap — no Step Functions
 involved. Only when a call needs human sign-off does the interceptor start
-a **Step Functions Express Sync** execution
-(`statemachine/escalation.asl.json`) that sends the push notification and
-waits on a task token, bounded by `TRUCLAW_CHALLENGE_TIMEOUT_SECONDS`
-(default 120s). The wait state lives in Step Functions, not in a Lambda's
-memory — any warm or cold `resume_handler.py` invocation can resolve any
-pending approval, because the task token, not local process state, is what
-Step Functions uses to find the paused execution.
+a **Step Functions STANDARD** execution (`statemachine/escalation.asl.json`)
+that sends the push notification and waits on a task token, bounded by
+`TRUCLAW_CHALLENGE_TIMEOUT_SECONDS` (default 120s). The wait state lives in
+Step Functions, not in a Lambda's memory — any warm or cold
+`resume_handler.py` invocation can resolve any pending approval, because
+the task token, not local process state, is what Step Functions uses to
+find the paused execution.
 
-This bounded-synchronous-wait design is a fit for short challenge windows
-(seconds to a couple minutes — Express Sync executions cap around 5
-minutes). It stops being a fit if approvals ever need a longer SLA (e.g.
-routed to an on-call rotation instead of an account owner's phone) — that
-would need a fully async "return pending, caller retries" model instead.
-Not built here; the seam for it is that only `escalation/send_challenge.py`
-would need to change, not the interceptor or the state machine shape.
+Standard, not Express: this started out as an Express Sync execution
+(bounded, blocking, cheap), which would have been the simpler design. It
+doesn't work — Express workflows, sync or async, don't support the
+`.waitForTaskToken` integration pattern at all, which came back as a
+`CREATE_FAILED` / `SCHEMA_VALIDATION_FAILED` error on an actual deploy, not
+something caught in review. Standard is the only state machine type that
+supports pausing on a task token, which the whole escalation flow depends
+on. The cost of that: Standard has no `StartSyncExecution` API, so
+`interceptor/handler.py:_escalate()` starts the execution with
+`StartExecution` and polls `DescribeExecution` in a short loop (2s
+interval) until it resolves or the deadline passes, rather than blocking on
+one synchronous call. Still synchronous from the Gateway's point of view —
+the interceptor doesn't return until it has an answer — just implemented as
+a poll against Step Functions' own durable execution state instead of an
+API that turned out not to support this pattern.
+
+This bounded-wait design (Standard + poll, capped around 130s including
+margin) is a fit for short challenge windows. It stops being a fit if
+approvals ever need a longer SLA (e.g. routed to an on-call rotation
+instead of an account owner's phone) — that would need a fully async
+"return pending, caller retries" model instead. Not built here; the seam
+for it is that only `escalation/send_challenge.py` would need to change,
+not the interceptor's overall shape or the state machine.
 
 ## Cedar / AgentCore Policy — kept deliberately separate
 
@@ -135,9 +151,13 @@ Pulled from AWS's published AgentCore pricing (verify current rates before
 committing): Gateway is $0.005 per 1,000 tool invocations, Policy
 authorization is $0.000025 per request, Identity is free when used through
 Runtime/Gateway, and Runtime is $0.0895/vCPU-hour + $0.00945/GB-hour billed
-per second with no CPU charge during I/O wait. Step Functions Express and
-Lambda both have meaningful always-free tiers that comfortably cover a
-pilot's volume. At pilot scale (order 10,000 tool calls/month) this is a
+per second with no CPU charge during I/O wait. Step Functions Standard
+workflows are billed per state transition (not per-request the way Express
+is) — the escalation workflow here is only a couple of transitions per
+execution, and only escalated calls start an execution at all, so this
+stays inside or close to the free tier at pilot volume. Lambda has its own
+meaningful always-free tier on top of that. At pilot scale (order 10,000
+tool calls/month) this is a
 single-digit-to-$20/month bill, dominated by CloudWatch log volume and
 whatever LLM the classifier calls. Re-estimate once you have a real
 production call-volume number — every component here is linear and cheap

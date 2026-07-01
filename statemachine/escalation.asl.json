@@ -1,5 +1,5 @@
 {
-  "Comment": "TruClaw escalation workflow. Started synchronously (StartSyncExecution) by interceptor/handler.py on ESCALATE. Express workflow type, since Express Sync executions are capped around 5 minutes -- comfortably above the default 120s CHALLENGE_TIMEOUT_SECONDS, but re-check this if the timeout is ever increased materially, or move to a Standard workflow + fully-async 'pending, caller retries' pattern instead (see interceptor/handler.py docstring).",
+  "Comment": "TruClaw escalation workflow. STANDARD state machine type (not Express -- Express doesn't support .waitForTaskToken at all, confirmed via a failed deploy). Started async (StartExecution) by interceptor/handler.py on ESCALATE, which then polls DescribeExecution in a bounded loop rather than blocking on a single synchronous call, since Standard has no StartSyncExecution API. This JSON file is a hand-maintained reference matching what infra/cdk/truclaw_stack.py actually builds via CDK constructs -- CDK does not load this file directly, so keep both in sync by hand if either changes.",
   "StartAt": "SendChallenge",
   "States": {
     "SendChallenge": {
