@@ -176,7 +176,7 @@ class TruClawStack(Stack):
                 "Token": sfn.JsonPath.task_token,
                 "payload": sfn.JsonPath.entire_payload,
             }),
-            timeout=Duration.seconds(150),
+            task_timeout=sfn.Timeout.duration(Duration.seconds(150)),
         )
 
         state_machine = sfn.StateMachine(
