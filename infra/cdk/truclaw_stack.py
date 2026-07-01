@@ -69,6 +69,45 @@ class TruClawStack(Stack):
             "AWS_REGION": self.region,
         }
 
+        # --- Secrets / operator-supplied config, read from the deployer's
+        # shell environment at `cdk deploy` time. These are NOT defaulted --
+        # missing either one means the interceptor fails closed on every
+        # dangerous call (no classifier key) or no push ever gets sent (no
+        # relay URL), so fail the synth loudly instead of deploying
+        # something silently broken.
+        #
+        # Plain Lambda environment variables are a pragmatic V1 choice, not
+        # the final answer for a real secret -- moving GOOGLE_API_KEY into
+        # AWS Secrets Manager (with the interceptor reading it at cold start
+        # instead of from os.environ) is a reasonable hardening step once
+        # this is past pilot stage. Not done here to keep this deploy path
+        # simple to reason about.
+        google_api_key = os.environ.get("GOOGLE_API_KEY")
+        relay_url = os.environ.get("TRUKYC_RELAY_URL")
+        if not google_api_key:
+            raise ValueError(
+                "GOOGLE_API_KEY must be set in your shell before `cdk deploy` -- "
+                "the interceptor's risk classifier needs it."
+            )
+        if not relay_url:
+            raise ValueError(
+                "TRUKYC_RELAY_URL must be set in your shell before `cdk deploy` -- "
+                "this is your push-notification relay's base URL."
+            )
+
+        # Optional knobs -- these already have sane defaults in
+        # truclaw_aws/config.py, only pass them through if the deployer
+        # wants to override the default.
+        optional_env = {
+            k: os.environ[k]
+            for k in (
+                "TRUCLAW_CLASSIFIER_MODEL",
+                "TRUCLAW_ENFORCE",
+                "TRUCLAW_CHALLENGE_TIMEOUT_SECONDS",
+            )
+            if k in os.environ
+        }
+
         # --- Interceptor Lambda: the actual before-tool-call hook ---
         interceptor_fn = lambda_.Function(
             self, "InterceptorFunction",
@@ -77,7 +116,7 @@ class TruClawStack(Stack):
             code=code_asset,
             timeout=Duration.seconds(150),  # > CHALLENGE_TIMEOUT_SECONDS (120s default)
             memory_size=256,
-            environment=common_env,
+            environment={**common_env, **optional_env, "GOOGLE_API_KEY": google_api_key},
         )
 
         # --- send_challenge Task Lambda (invoked by the state machine) ---
@@ -88,7 +127,7 @@ class TruClawStack(Stack):
             code=code_asset,
             timeout=Duration.seconds(30),
             memory_size=128,
-            environment=common_env,
+            environment={**common_env, "TRUKYC_RELAY_URL": relay_url},
         )
 
         # --- resume_handler Lambda, fronted by a Function URL the relay calls ---
