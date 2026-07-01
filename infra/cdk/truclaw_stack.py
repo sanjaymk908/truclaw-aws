@@ -1,0 +1,155 @@
+"""
+CDK stack for the "classic" AWS resources: S3, Lambda, Step Functions, IAM,
+EventBridge. This does NOT create the AgentCore Gateway, Runtime, or
+Identity resources -- CDK L2 support for AgentCore is not mature enough at
+the time of writing to trust generated constructs for it, and getting the
+Gateway interceptor wiring right matters more than saving a few manual
+steps. See infra/scripts/setup_agentcore.sh for that half, using the
+`agentcore` CLI (aws/bedrock-agentcore-starter-toolkit) instead.
+
+Deployment order: `cdk deploy` this stack first (it has no AgentCore
+dependency), note the outputs (bucket name, Lambda ARNs, state machine ARN,
+resume handler Function URL), then run setup_agentcore.sh with those values
+to wire the Gateway interceptor to the interceptor Lambda's ARN.
+"""
+import os
+
+from aws_cdk import (
+    Stack, Duration, CfnOutput, BundlingOptions, DockerImage,
+    aws_s3 as s3,
+    aws_lambda as lambda_,
+    aws_iam as iam,
+    aws_stepfunctions as sfn,
+    aws_stepfunctions_tasks as tasks,
+    aws_events as events,
+    aws_events_targets as targets,
+)
+from constructs import Construct
+
+REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+class TruClawStack(Stack):
+    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+        super().__init__(scope, construct_id, **kwargs)
+
+        # --- S3 bucket: replaces the GCS bucket entirely (policies, ledger
+        # shards, memory.md, usage_summary.json, device pairing records) ---
+        bucket = s3.Bucket(
+            self, "TruClawBucket",
+            enforce_ssl=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="expire-old-ledger-shards",
+                    prefix="truclaw/policies/",
+                    expiration=Duration.days(400),  # audit retention; tune per compliance need
+                )
+            ],
+        )
+
+        # All Lambdas share one asset: the whole repo, with third-party deps
+        # pip-installed into the asset at build time. boto3 ships with the
+        # Lambda runtime already; httpx, cryptography, and google-genai do
+        # not, hence the bundling step below.
+        code_asset = lambda_.Code.from_asset(
+            REPO_ROOT,
+            bundling=BundlingOptions(
+                image=DockerImage.from_registry("public.ecr.aws/sam/build-python3.12"),
+                command=[
+                    "bash", "-c",
+                    "pip install -r requirements.txt -t /asset-output && "
+                    "cp -au truclaw_aws interceptor escalation aggregator admin /asset-output/",
+                ],
+            ),
+        )
+
+        common_env = {
+            "TRUCLAW_S3_BUCKET": bucket.bucket_name,
+            "AWS_REGION": self.region,
+        }
+
+        # --- Interceptor Lambda: the actual before-tool-call hook ---
+        interceptor_fn = lambda_.Function(
+            self, "InterceptorFunction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="interceptor.handler.handle",
+            code=code_asset,
+            timeout=Duration.seconds(150),  # > CHALLENGE_TIMEOUT_SECONDS (120s default)
+            memory_size=256,
+            environment=common_env,
+        )
+
+        # --- send_challenge Task Lambda (invoked by the state machine) ---
+        send_challenge_fn = lambda_.Function(
+            self, "SendChallengeFunction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="escalation.send_challenge.handle",
+            code=code_asset,
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment=common_env,
+        )
+
+        # --- resume_handler Lambda, fronted by a Function URL the relay calls ---
+        resume_fn = lambda_.Function(
+            self, "ResumeHandlerFunction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="escalation.resume_handler.handle",
+            code=code_asset,
+            timeout=Duration.seconds(15),
+            memory_size=128,
+            environment=common_env,
+        )
+        resume_url = resume_fn.add_function_url(
+            auth_type=lambda_.FunctionUrlAuthType.NONE,  # the JWT in the body is the auth
+        )
+
+        # --- aggregator Lambda, on an hourly EventBridge schedule ---
+        aggregator_fn = lambda_.Function(
+            self, "AggregatorFunction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="aggregator.handler.handle",
+            code=code_asset,
+            timeout=Duration.minutes(5),
+            memory_size=256,
+            environment=common_env,
+        )
+        events.Rule(
+            self, "AggregatorSchedule",
+            schedule=events.Schedule.rate(Duration.hours(1)),
+            targets=[targets.LambdaFunction(aggregator_fn)],
+        )
+
+        for fn in (interceptor_fn, send_challenge_fn, resume_fn, aggregator_fn):
+            bucket.grant_read_write(fn)
+
+        # --- Step Functions Express state machine (escalation workflow) ---
+        send_challenge_task = tasks.LambdaInvoke(
+            self, "SendChallengeTask",
+            lambda_function=send_challenge_fn,
+            integration_pattern=sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+            payload=sfn.TaskInput.from_object({
+                "Token": sfn.JsonPath.task_token,
+                "payload": sfn.JsonPath.entire_payload,
+            }),
+            timeout=Duration.seconds(150),
+        )
+
+        state_machine = sfn.StateMachine(
+            self, "EscalationStateMachine",
+            state_machine_type=sfn.StateMachineType.EXPRESS,
+            definition_body=sfn.DefinitionBody.from_chainable(send_challenge_task),
+            timeout=Duration.minutes(4),
+        )
+
+        interceptor_fn.add_environment(
+            "TRUCLAW_ESCALATION_STATE_MACHINE_ARN", state_machine.state_machine_arn
+        )
+        state_machine.grant_start_sync_execution(interceptor_fn)
+        state_machine.grant_task_response(resume_fn)
+
+        CfnOutput(self, "BucketName", value=bucket.bucket_name)
+        CfnOutput(self, "InterceptorFunctionArn", value=interceptor_fn.function_arn)
+        CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
+        CfnOutput(self, "ResumeHandlerUrl", value=resume_url.url)

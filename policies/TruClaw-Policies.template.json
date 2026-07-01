@@ -1,0 +1,34 @@
+{
+  "agentId": "REPLACE_WITH_AGENT_NAME",
+  "version": "1.0.0",
+  "safeTools": [
+    "read",
+    "session_status",
+    "list",
+    "ls",
+    "web_search",
+    "web_fetch",
+    "browser_snapshot",
+    "status",
+    "truclaw_pair",
+    "truclaw_status",
+    "transfer_to_agent",
+    "transfer_to_agent_tool",
+    "agent_transfer",
+    "load_artifacts",
+    "list_artifacts",
+    "save_artifacts"
+  ],
+  "alwaysDangerousTools": [
+    "place_trade",
+    "execute_trade",
+    "send_email",
+    "send_email_via_porteden",
+    "delete_email",
+    "forward_email",
+    "reply_email"
+  ],
+  "unclassified": [],
+  "toolThresholds": {},
+  "businessRules": "No specific business rules configured. All unclassified tool calls will be evaluated by the security classifier. Update this field with domain-specific policy before deploying to production."
+}

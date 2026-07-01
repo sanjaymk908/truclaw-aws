@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.env
+.truclaw/
+
+# CDK
+infra/cdk/cdk.out/
+infra/cdk/.venv/

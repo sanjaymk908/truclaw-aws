@@ -1,0 +1,38 @@
+{
+  "Comment": "TruClaw escalation workflow. Started synchronously (StartSyncExecution) by interceptor/handler.py on ESCALATE. Express workflow type, since Express Sync executions are capped around 5 minutes -- comfortably above the default 120s CHALLENGE_TIMEOUT_SECONDS, but re-check this if the timeout is ever increased materially, or move to a Standard workflow + fully-async 'pending, caller retries' pattern instead (see interceptor/handler.py docstring).",
+  "StartAt": "SendChallenge",
+  "States": {
+    "SendChallenge": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${SendChallengeFunctionArn}",
+        "Payload": {
+          "Token.$": "$$.Task.Token",
+          "payload.$": "$"
+        }
+      },
+      "TimeoutSecondsPath": "$.timeoutSeconds",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Denied"
+        }
+      ],
+      "Next": "Resolved"
+    },
+    "Resolved": {
+      "Type": "Pass",
+      "End": true
+    },
+    "Denied": {
+      "Type": "Pass",
+      "Parameters": {
+        "approved": false,
+        "reason.$": "States.Format('escalation did not resolve: {}', $.error.Cause)"
+      },
+      "End": true
+    }
+  }
+}
