@@ -64,9 +64,13 @@ class TruClawStack(Stack):
             ),
         )
 
+        # NOTE: AWS_REGION is deliberately not set here -- Lambda's runtime
+        # injects it automatically, and CDK/CloudFormation will reject an
+        # explicit attempt to set it as a reserved environment variable.
+        # truclaw_aws/config.py reads it via os.getenv("AWS_REGION", ...)
+        # and will pick up the runtime-provided value with no extra wiring.
         common_env = {
             "TRUCLAW_S3_BUCKET": bucket.bucket_name,
-            "AWS_REGION": self.region,
         }
 
         # --- Secrets / operator-supplied config, read from the deployer's
