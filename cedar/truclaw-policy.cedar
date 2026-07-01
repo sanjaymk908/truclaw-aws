@@ -1,19 +1,24 @@
 // Cedar translation of policies/TruClaw-Policies.template.json.
 //
+// *** SUPERSEDED BY docs/ARCHITECTURE.md's "Cedar / AgentCore Policy" section. ***
+// This file was a feasibility sketch showing that toolThresholds and
+// alwaysDangerousTools *can* be expressed in Cedar via a context.humanApproved
+// workaround -- not that they *should* be. The current direction keeps all
+// risk-tiering logic in truclaw_aws/danger.py + policy.py unchanged, and
+// reserves Cedar for a separate, smaller set of static authorization facts
+// (not built yet). Read this file as "here's how the mapping works," not
+// as the intended production policy set.
+//
 // This covers exactly the three deterministic tiers Cedar can express --
 // safeTools, alwaysDangerousTools, toolThresholds. `businessRules` (the
 // template's free-text field) has NO Cedar equivalent and is not
 // translated below -- it stays exactly where it is today, as prompt
 // context handed to the Gemini classifier in truclaw_aws/danger.py for any
 // tool call that falls through every policy statement here ("unclassified"
-// in the JSON). Cedar is a deterministic, statically-analyzable language;
-// "use judgment per this paragraph" isn't representable in it, and that's
-// not a gap to close -- the classifier tier is TruClaw's actual product,
-// not something Policy is meant to absorb.
+// in the JSON).
 //
 // *** ILLUSTRATIVE -- confirm exact resource/action shape against live
-// AgentCore Policy docs before deploying. The decision logic below is the
-// real design; the surrounding schema wiring is the part to re-verify. ***
+// AgentCore Policy docs before deploying. ***
 
 // === safeTools -> unconditional permit, one clause, mirrors the JSON array ===
 permit(
