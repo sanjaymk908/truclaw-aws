@@ -1,0 +1,35 @@
+// Cedar schema for TruClaw's AgentCore Policy integration.
+//
+// *** ILLUSTRATIVE, NOT VERIFIED AGAINST A LIVE AGENTCORE POLICY SCHEMA ***
+// Entity/action names here follow Cedar's documented syntax faithfully, but
+// AgentCore Policy may impose its own required entity/action shape for
+// Gateway-routed tool calls. Confirm against current AgentCore Policy docs
+// before deploying -- same caveat as interceptor/handler.py's Gateway event
+// parsing.
+
+entity Agent;
+entity User;
+
+entity Tool = {
+  toolName: String,
+};
+
+action InvokeTool appliesTo {
+  principal: [Agent, User],
+  resource: Tool,
+  context: {
+    userId: String,
+    // Populated by interceptor/handler.py before calling Policy -- Cedar
+    // has no aggregation of its own, so daily/weekly counts still come
+    // from truclaw_aws/policy.py's usage_summary.json lookup, same as
+    // today. Cedar only replaces the *comparison*, not the aggregation.
+    amount?: Long,
+    dailyCount?: Long,
+    weeklyCount?: Long,
+    // Set to true only after escalation/resume_handler.py has already
+    // resolved a human approval for this specific call. See the note in
+    // truclaw-policy.cedar on why this is a one-way flag, not something
+    // Policy computes itself.
+    humanApproved?: Bool,
+  },
+};
