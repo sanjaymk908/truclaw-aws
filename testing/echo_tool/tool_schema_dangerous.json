@@ -1,0 +1,12 @@
+{
+  "_comment": "Track B (ESCALATE path). Named 'send_email' deliberately -- it's already in TruClaw-Policies.template.json's default alwaysDangerousTools, so no policy edit is needed to test escalation. Doesn't actually send an email -- same echo handler as the safe-path registration.",
+  "name": "send_email",
+  "description": "Throwaway smoke-test tool, dangerous path. Echoes back whatever message it's given -- name chosen only to trip TruClaw's alwaysDangerousTools rule.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "message": {"type": "string", "description": "Any text to echo back."}
+    },
+    "required": ["message"]
+  }
+}

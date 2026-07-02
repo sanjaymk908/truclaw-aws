@@ -1,0 +1,4 @@
+This file is superseded by tool_schema_safe.json and tool_schema_dangerous.json
+in this same directory. Safe to delete -- kept only because the sandbox this
+was authored in couldn't unlink it (a permissions quirk on the mounted
+folder, not anything meaningful about the file itself).

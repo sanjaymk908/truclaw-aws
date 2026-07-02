@@ -1,0 +1,12 @@
+{
+  "_comment": "Track A (ALLOW path). Named 'read' deliberately -- it's already in TruClaw-Policies.template.json's default safeTools, so no policy edit is needed to test the fast-path allow.",
+  "name": "read",
+  "description": "Throwaway smoke-test tool, safe path. Echoes back whatever message it's given.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "message": {"type": "string", "description": "Any text to echo back."}
+    },
+    "required": ["message"]
+  }
+}
