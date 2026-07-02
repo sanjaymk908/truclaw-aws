@@ -1,16 +1,15 @@
 """
 AgentCore Gateway REQUEST interceptor — the native "before-tool-call hook".
 
-*** VERIFY BEFORE PRODUCTION ***
-AgentCore Gateway interceptors are a new (2026) capability and the exact
-event/response JSON shape is not fully stabilized in public docs at the time
-this port was written. `_parse_gateway_event` and the return shape at the
-bottom of `handle` are written against the documented *concept* (interceptor
-receives tool name/args/identity context, returns allow/deny/transform), not
-a verified field-for-field schema. Confirm exact field names against the
-current "Using interceptors with Gateway" doc and adjust the two marked
-functions before pointing a real Gateway at this — the decision logic in
-between (which is the actual hook design) does not need to change.
+*** REMAINING VERIFICATION NEEDED ***
+The request/tool-call event shape (`_parse_gateway_event`) is now confirmed
+against a real invocation, not guessed -- see docs/ARCHITECTURE.md. Two
+things are still unverified: (1) identity extraction (`context.identity`)
+has only been observed as null, on a non-authenticated `initialize` call --
+not yet confirmed against a real authenticated `tools/call`; (2)
+`_gateway_response`'s ALLOW/DENY shape hasn't been independently confirmed
+as correct by AWS docs, only inferred from the fact that real calls made it
+this far without the Gateway itself rejecting the response shape.
 
 This replaces truclaw_adk's approach of monkey-patching ADK's
 `before_tool_callback` on the live agent tree (see the old protect.py /
@@ -56,20 +55,61 @@ from truclaw_aws.logging import log
 
 
 def _parse_gateway_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    """*** VERIFY FIELD NAMES AGAINST CURRENT AGENTCORE GATEWAY DOCS ***
+    """Real shape, confirmed via a live diagnostic capture against a
+    deployed Gateway (not guessed -- see docs/ARCHITECTURE.md for the raw
+    event this was reverse-engineered from):
 
-    Expected shape (conceptual, per AWS's "Using interceptors with Gateway"
-    docs as of this writing): the interceptor receives the tool/target name,
-    the arguments the agent supplied, and identity context propagated by
-    AgentCore Identity (the calling agent principal + end-user session).
+        event = {
+          "interceptorInputVersion": "1.0",
+          "mcp": {
+            "gatewayRequest": {
+              "path": "/mcp", "httpMethod": "POST",
+              "headers": {...},  # empty today, passRequestHeaders=false
+              "body": {"id": ..., "method": "...", "params": {...}, "jsonrpc": "2.0"},
+              "context": ...  # null on the one real event seen so far (an
+                               # `initialize` call) -- identity extraction
+                               # below is still best-effort until a real
+                               # authenticated tools/call is captured.
+            },
+            "gatewayResponse": ...,  # presumably populated for RESPONSE-type interceptions
+            "rawGatewayRequest": {"body": "<raw JSON string>"}
+          }
+        }
+
+    Critical thing this shape revealed that the earlier guess completely
+    missed: the interceptor fires on EVERY MCP protocol message flowing
+    through the Gateway, not just tool invocations -- `initialize`,
+    `tools/list`, `notifications/initialized`, `ping`, etc. all hit this
+    same interceptor. Only `body.method == "tools/call"` has a tool
+    name/arguments to evaluate (per the MCP spec, `params` for that method
+    is `{"name": ..., "arguments": {...}}`). Every other method must be
+    passed through without ever reaching check_danger() -- that's the
+    actual bug that crashed the first real invocation (tool_name was None
+    for an `initialize` call, and check_danger() isn't meant to be called
+    for non-tool-call messages at all, not just handed a None safely).
     """
-    tool = event.get("toolName") or event.get("targetName") or event.get("tool", {}).get("name")
-    args = event.get("arguments") or event.get("toolArgs") or event.get("input") or {}
-    identity = event.get("identity") or event.get("requestContext", {}).get("identity", {})
-    agent_id = identity.get("agentId") or identity.get("principalId") or event.get("agentId", "unknown")
-    user_id = identity.get("userId") or identity.get("sessionUserId") or event.get("userId", "default")
+    gateway_request = (event.get("mcp") or {}).get("gatewayRequest") or {}
+    body = gateway_request.get("body") or {}
+    method = body.get("method")
 
-    return {"tool": tool, "args": args, "agentId": agent_id, "userId": user_id}
+    if method != "tools/call":
+        return {"isToolCall": False, "method": method, "tool": None, "args": {}, "agentId": "unknown", "userId": "default"}
+
+    params = body.get("params") or {}
+    tool = params.get("name")
+    args = params.get("arguments") or {}
+
+    # Identity: unverified against a real authenticated call yet (the one
+    # real event captured so far had context=null, since `initialize`
+    # doesn't carry caller identity). Defensive fallbacks kept so this
+    # degrades to "unknown"/"default" rather than crashing if the real
+    # shape for an authenticated tools/call turns out to differ.
+    ctx = gateway_request.get("context") or {}
+    identity = ctx.get("identity", {}) if isinstance(ctx, dict) else {}
+    agent_id = identity.get("agentId") or identity.get("principalId") or "unknown"
+    user_id = identity.get("userId") or identity.get("sessionUserId") or "default"
+
+    return {"isToolCall": True, "method": method, "tool": tool, "args": args, "agentId": agent_id, "userId": user_id}
 
 
 def _gateway_response(action: str, **extra) -> Dict[str, Any]:
@@ -95,6 +135,16 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     log(f"[interceptor] RAW EVENT (diagnostic): {json.dumps(event, default=str)}")
 
     parsed = _parse_gateway_event(event)
+
+    if not parsed["isToolCall"]:
+        # Protocol-level MCP message (initialize, tools/list,
+        # notifications/initialized, ping, etc.) -- TruClaw has no opinion
+        # on these, they never reach check_danger(). Not logged to the
+        # ledger either; this isn't a tool-call decision, there's nothing
+        # to audit.
+        log(f"[interceptor] non-tool-call MCP method={parsed['method']}, passing through")
+        return _gateway_response("ALLOW")
+
     tool_name, tool_args = parsed["tool"], parsed["args"]
     agent_id, user_id = parsed["agentId"], parsed["userId"]
 

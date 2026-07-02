@@ -146,16 +146,51 @@ See `infra/scripts/setup_agentcore.sh` for the full sequence (create the
 Gateway and its IAM role via the `agentcore` CLI, register tool targets,
 then this raw `update-gateway` call for the interceptor attachment itself).
 
-What's still genuinely unverified: the exact request/response JSON shape
-the interceptor Lambda receives and must return (`passRequestHeaders`
-controls whether headers are included, but the full payload schema wasn't
-pinned down from the docs fetched so far). `interceptor/handler.py`'s
-`_parse_gateway_event` and `_gateway_response` remain written against the
-documented *concept*, not a verified field-for-field schema — confirm
-against a real invocation (CloudWatch logs from a live test call) before
-trusting the identity/tool-name extraction in production. The decision
-logic in between (the actual hook design) doesn't need to change regardless
-of how those two functions end up being adjusted.
+**Update — the event shape is now confirmed, via a real invocation, not
+guessed.** The temporary raw-event diagnostic logging added earlier
+(still present in `interceptor/handler.py`, not yet removed) captured
+this real payload from the deployed Gateway for an MCP `initialize`
+message:
+
+```json
+{
+  "interceptorInputVersion": "1.0",
+  "mcp": {
+    "gatewayRequest": {
+      "path": "/mcp", "httpMethod": "POST", "headers": {},
+      "body": {"id": 0, "method": "initialize", "params": {...}, "jsonrpc": "2.0"},
+      "context": null
+    },
+    "gatewayResponse": null,
+    "rawGatewayRequest": {"body": "..."}
+  }
+}
+```
+
+The important thing this revealed, which the earlier guess completely
+missed: **the interceptor fires on every MCP protocol message flowing
+through the Gateway, not just tool invocations** — `initialize`,
+`tools/list`, `notifications/initialized`, `ping`, etc. all hit the same
+interceptor. Only `body.method == "tools/call"` has a tool name/arguments
+to evaluate (per the MCP spec, that method's `params` are
+`{"name": ..., "arguments": {...}}`). The first real invocation crashed
+specifically because `_parse_gateway_event` had no concept of "this isn't
+a tool call" — it always tried to extract a tool name and always called
+`check_danger()`, which blew up on `None.split(".")` for an `initialize`
+message. Fixed: `_parse_gateway_event` now returns `isToolCall: False` for
+any non-`tools/call` method, and `handle()` passes those through as
+`ALLOW` before ever reaching the danger-check logic. Regression-tested in
+`tests/test_interceptor.py` against the real captured shape.
+
+Still genuinely unverified: identity extraction (`gatewayRequest.context`)
+was `null` on the one real event captured so far — but that was an
+`initialize` call, which has no caller identity of its own by definition.
+Whether `context.identity` gets populated for an authenticated `tools/call`
+(and in what shape) hasn't been confirmed yet. `_gateway_response`'s
+ALLOW/DENY shape also hasn't been independently confirmed as *correct* by
+AWS docs — only inferred from real calls reaching this far without the
+Gateway itself rejecting the response format. Both need a real
+authenticated `tools/call` to fully close out.
 
 There's also a CDK alpha module specifically for this —
 `@aws-cdk/aws-bedrock-agentcore-alpha` — which reportedly supports
