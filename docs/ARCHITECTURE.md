@@ -120,17 +120,52 @@ transaction risk logic changes. That authorization layer isn't built yet
 — `cedar/` should be read as a mapping-feasibility sketch, not the
 intended production design.
 
-## Known open question before production
+## Attaching the interceptor to a real Gateway (resolved)
 
-AgentCore Gateway interceptors are a new (2026) capability, and the exact
-request/response JSON schema for a REQUEST interceptor isn't fully
-stabilized in public docs as of this writing. `interceptor/handler.py`'s
-`_parse_gateway_event` and `_gateway_response` are written against the
+This was flagged as an open question and is now confirmed against AWS's
+own API reference, not guessed. Neither CLI tool supports configuring
+interceptors: the deprecated `bedrock-agentcore-starter-toolkit` has no
+interceptor-related command at all, and the current `@aws/agentcore` CLI's
+own docs say so explicitly — "With the AgentCore CLI, first create and
+deploy the gateway, then configure interceptors using the AWS CLI or AWS
+Python SDK (Boto3)." Interceptor configuration is a parameter on the raw
+`create-gateway`/`update-gateway` API operations
+(`GatewayInterceptorConfiguration`), not a separate resource or command:
+
+```
+aws bedrock-agentcore-control update-gateway \
+  --gateway-identifier <gateway-id> \
+  --interceptor-configurations '[{
+      "interceptor": {"lambda": {"arn": "<interceptor Lambda ARN>"}},
+      "interceptionPoints": ["REQUEST"],
+      "inputConfiguration": {"passRequestHeaders": false}
+  }]'
+```
+
+See `infra/scripts/setup_agentcore.sh` for the full sequence (create the
+Gateway and its IAM role via the `agentcore` CLI, register tool targets,
+then this raw `update-gateway` call for the interceptor attachment itself).
+
+What's still genuinely unverified: the exact request/response JSON shape
+the interceptor Lambda receives and must return (`passRequestHeaders`
+controls whether headers are included, but the full payload schema wasn't
+pinned down from the docs fetched so far). `interceptor/handler.py`'s
+`_parse_gateway_event` and `_gateway_response` remain written against the
 documented *concept*, not a verified field-for-field schema — confirm
-against the current "Using interceptors with Gateway" AWS docs before
-pointing a real Gateway at this. The decision logic in between (the actual
-hook design) doesn't need to change regardless of how those two functions
-end up being adjusted.
+against a real invocation (CloudWatch logs from a live test call) before
+trusting the identity/tool-name extraction in production. The decision
+logic in between (the actual hook design) doesn't need to change regardless
+of how those two functions end up being adjusted.
+
+There's also a CDK alpha module specifically for this —
+`@aws-cdk/aws-bedrock-agentcore-alpha` — which reportedly supports
+attaching a Lambda interceptor as a first-class construct with automatic
+IAM permission grants. Not adopted here yet (alpha-versioned, and its exact
+Python API wasn't verified before this was written), but worth evaluating
+as a follow-up to fold Gateway + interceptor creation into
+`infra/cdk/truclaw_stack.py` directly instead of the separate imperative
+script, for the same reason everything else in this repo is CDK-managed
+rather than click-ops or one-off CLI commands.
 
 ## What's deliberately not built yet
 
