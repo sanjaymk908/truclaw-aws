@@ -84,6 +84,16 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Lambda entrypoint. Synchronous by design — see module docstring for
     why individual Lambda invocations stay synchronous even though the
     overall escalation flow is async at the architecture level."""
+    # TEMPORARY DIAGNOSTIC — remove once _parse_gateway_event is verified
+    # against a real invocation. Logs the complete raw event so the actual
+    # Gateway interceptor payload shape can be read from CloudWatch Logs
+    # instead of guessed at. Safe to leave in short-term only because
+    # passRequestHeaders is currently false on this Gateway (see
+    # docs/ARCHITECTURE.md) -- if that's ever flipped to true, this line
+    # would start logging raw Authorization headers/tokens and must come
+    # out first.
+    log(f"[interceptor] RAW EVENT (diagnostic): {json.dumps(event, default=str)}")
+
     parsed = _parse_gateway_event(event)
     tool_name, tool_args = parsed["tool"], parsed["args"]
     agent_id, user_id = parsed["agentId"], parsed["userId"]
