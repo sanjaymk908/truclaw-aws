@@ -168,6 +168,7 @@ Trigger a few test tool calls through your agent and confirm:
 
 ```
 python -m admin.cli view-ledger  --agent-id <id> [--limit N]   # inspect recent decisions
+python -m admin.cli view-memory  --agent-id <id>                # inspect the behavioral summary
 python -m admin.cli clear-ledger --agent-id <id>                # wipe the audit log
 python -m admin.cli clear-memory --agent-id <id>                # wipe the behavioral summary
 python -m admin.cli clear-all    --agent-id <id>                # both

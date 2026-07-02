@@ -145,6 +145,12 @@ def dangerous_prior_flag(agent_id: str, limit: int = 5) -> str:
 
 
 def _load_memory(agent_id: str) -> str:
+    return read_memory(agent_id)
+
+
+def read_memory(agent_id: str) -> str:
+    """Public accessor for the aggregator-generated memory.md — used by
+    prior_summary() internally, and by admin/cli.py's view-memory command."""
     raw = s3_get_bytes(MEMORY_KEY_TMPL.format(agent_id=agent_id))
     if not raw:
         return ""
