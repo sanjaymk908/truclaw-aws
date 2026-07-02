@@ -169,6 +169,48 @@ rather than click-ops or one-off CLI commands.
 
 ## What's deliberately not built yet
 
+### Priority follow-up: no path to surface business-logic failures to the end user
+
+Real gap, not a nice-to-have. Today, when something like "no paired device"
+fails a request, it's visible in exactly two places: the S3 ledger
+(admin-only, via `admin/cli.py`) and a `DENY` response with a free-text
+`reason` string handed back through the Gateway to the *calling agent* —
+not the customer. What the agent does with that string is undefined; a
+customer has no realistic way to learn "you need to pair a device" from
+either surface, and they should never be expected to be reading CloudWatch
+logs to find out why an action silently failed.
+
+Root cause: this repo ported the enforcement machinery from the original
+implementation but not the user-facing pairing/onboarding flow
+(`pair_route.py`, the "say *pair my TruClaw device*" conversational entry
+point in `chat_handler.py`) — neither was ported, both were judged
+FastAPI/Google-Chat-specific glue out of scope for the Gateway-interceptor
+design. `truclaw_aws/pairing.py` still has the underlying
+`start_pairing()`/`poll_for_pairing()` logic; nothing in this repo invokes
+it or exposes it to an end user.
+
+Two concrete pieces of work, not one:
+1. Structure `DENY` responses with a machine-readable `reasonCode` (e.g.
+   `NO_PAIRED_DEVICE`) instead of only a free-text `reason`, so a calling
+   agent *can* build real UX around it — and document this as an explicit
+   integration contract for agent authors.
+2. Build or re-port an actual pairing-initiation flow, and make it
+   proactive where possible (tell a user they need to pair *before* they
+   hit a wall on a real dangerous action, not only reactively when one
+   fails).
+
+**Important constraint on any future design here, settled explicitly:**
+whatever notification/approval surface gets built must stay strictly
+out-of-band from the agent's own chat/UI channel. The security value of
+the signed-device-approval mechanism comes entirely from being
+independent of anything the agent (or content it ingests, e.g. a prompt
+injection) can influence or render. Do not fold this into an in-chat
+mechanism like AgentCore's AG-UI protocol, however convenient that might
+look — collapsing the approval surface into the same channel as the
+action being approved defeats the purpose of an independent check.
+
+### Other follow-ups
+
 - **Cedar-based coarse authorization** (see above) — a real hardening
   step, scoped separately from this repo's risk-decisioning logic.
 - **On-call / escalation-chain routing.** `escalation/send_challenge.py`
@@ -179,6 +221,14 @@ rather than click-ops or one-off CLI commands.
 - **A Bedrock-hosted classifier model.** `danger.py` keeps calling Gemini
   directly. `_bedrock_generate` is a stub, not wired in, not exercised
   against a live endpoint.
+- **Step Functions Catch/Denied inconsistency.** The standalone reference
+  `statemachine/escalation.asl.json` has an explicit `Catch` → `Denied`
+  state for a clean timeout output; the actual CDK-deployed construct in
+  `infra/cdk/truclaw_stack.py` doesn't have the equivalent wired in.
+  Harmless today because `interceptor/handler.py`'s poll loop
+  independently treats any non-SUCCEEDED terminal execution status as a
+  deny, but worth reconciling for consistency between the reference file
+  and what's actually deployed.
 
 ## Cost detail
 
