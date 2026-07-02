@@ -186,11 +186,45 @@ Still genuinely unverified: identity extraction (`gatewayRequest.context`)
 was `null` on the one real event captured so far — but that was an
 `initialize` call, which has no caller identity of its own by definition.
 Whether `context.identity` gets populated for an authenticated `tools/call`
-(and in what shape) hasn't been confirmed yet. `_gateway_response`'s
-ALLOW/DENY shape also hasn't been independently confirmed as *correct* by
-AWS docs — only inferred from real calls reaching this far without the
-Gateway itself rejecting the response format. Both need a real
-authenticated `tools/call` to fully close out.
+(and in what shape) hasn't been confirmed yet. Needs a real authenticated
+`tools/call` to close out.
+
+### The response shape was wrong, and a live test caught it (resolved)
+
+The first fixed build of the interceptor got past the `initialize` crash
+above, but the very next real invocation failed differently: the Gateway's
+own vended logs recorded `"log": "Received invalid response from
+interceptor"`. The response shape (`_gateway_response`, returning
+`{"action": "ALLOW"|"DENY"}`) had been *invented* by inference, never
+checked against AWS's actual interceptor contract. It was wrong.
+
+The real contract, confirmed directly from AWS's docs
+(`gateway-interceptors-types.html`, not guessed): a REQUEST interceptor has
+no allow/deny verb at all. It must return one of:
+
+- `mcp.transformedGatewayRequest.body` — the (optionally modified) JSON-RPC
+  request body. Returning the original body unchanged is how you express
+  ALLOW; the Gateway proceeds to call the target with that body.
+- `mcp.transformedGatewayResponse` (`statusCode` + JSON-RPC `body`) — the
+  Gateway responds with this immediately and never calls the target ("If
+  the interceptor output contains a transformedGatewayResponse, the
+  gateway will respond with that content immediately, even if
+  transformedGatewayRequest is also provided."). This is how DENY has to
+  be expressed: synthesize a JSON-RPC error response yourself, using the
+  original request's `id`, since there's no native reject.
+
+Both are wrapped in `{"interceptorOutputVersion": "1.0", "mcp": {...}}`.
+Fixed in `interceptor/handler.py` as `_allow_response` / `_deny_response`,
+replacing the old `_gateway_response`. Regression-tested in
+`tests/test_interceptor.py`.
+
+One caveat that's still a best-effort choice rather than a confirmed fact:
+the JSON-RPC error `code` used for DENY (`-32001`, within the
+implementation-defined server-error range per the JSON-RPC 2.0 spec).
+AWS's docs show the ALLOW/pass-through shape worked end-to-end but don't
+include a worked DENY/error example, so only the response *envelope* is
+confirmed — the specific error code and how MCP clients are expected to
+surface it to a calling agent is not.
 
 There's also a CDK alpha module specifically for this —
 `@aws-cdk/aws-bedrock-agentcore-alpha` — which reportedly supports

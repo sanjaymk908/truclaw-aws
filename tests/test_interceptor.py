@@ -1,12 +1,22 @@
 """
-Regression test for _parse_gateway_event's now-confirmed real event shape.
-The two fixtures below are trimmed versions of an actual raw event
-captured from a deployed Gateway (see docs/ARCHITECTURE.md) -- not
-hypothetical. Losing this fix would silently reintroduce the crash where
-every non-tools/call MCP message (initialize, tools/list, ping, etc.)
-got passed to check_danger() and blew up on tool_name.split().
+Regression tests for the interceptor's request-parsing AND response-shape
+logic, both reverse-engineered from real, confirmed sources (see
+docs/ARCHITECTURE.md):
+
+1. _parse_gateway_event's event shape -- captured live from a deployed
+   Gateway. Losing this fix would silently reintroduce the crash where
+   every non-tools/call MCP message (initialize, tools/list, ping, etc.)
+   got passed to check_danger() and blew up on tool_name.split().
+
+2. _allow_response / _deny_response's output shape -- confirmed against
+   AWS's official docs (gateway-interceptors-types.html), NOT the earlier
+   invented `{"action": "ALLOW"|"DENY"}` payload, which a live Gateway
+   invocation rejected outright with "Received invalid response from
+   interceptor". Losing this fix would silently reintroduce that failure:
+   every single tool call, safe or dangerous, would be rejected by the
+   Gateway before ever reaching the target.
 """
-from interceptor.handler import _parse_gateway_event
+from interceptor.handler import _parse_gateway_event, _allow_response, _deny_response
 
 REAL_INITIALIZE_EVENT = {
     "interceptorInputVersion": "1.0",
@@ -69,3 +79,26 @@ def test_missing_mcp_key_does_not_crash():
     parsed = _parse_gateway_event({})
     assert parsed["isToolCall"] is False
     assert parsed["tool"] is None
+
+
+def test_allow_response_echoes_original_body_via_transformed_request():
+    body = TOOLS_CALL_EVENT["mcp"]["gatewayRequest"]["body"]
+    resp = _allow_response(body)
+    assert resp["interceptorOutputVersion"] == "1.0"
+    assert resp["mcp"]["transformedGatewayRequest"]["body"] == body
+    # ALLOW must never carry a transformedGatewayResponse -- per AWS docs,
+    # if one is present the Gateway responds immediately and skips the
+    # target entirely, which would break every safe tool call.
+    assert "transformedGatewayResponse" not in resp["mcp"]
+
+
+def test_deny_response_synthesizes_jsonrpc_error_with_matching_id():
+    body = TOOLS_CALL_EVENT["mcp"]["gatewayRequest"]["body"]
+    resp = _deny_response(body, reason="blocked by policy", actionTitle="Send email")
+    assert resp["interceptorOutputVersion"] == "1.0"
+    transformed = resp["mcp"]["transformedGatewayResponse"]
+    assert transformed["statusCode"] == 200
+    assert transformed["body"]["jsonrpc"] == "2.0"
+    assert transformed["body"]["id"] == body["id"]
+    assert transformed["body"]["error"]["message"] == "blocked by policy"
+    assert transformed["body"]["error"]["data"]["actionTitle"] == "Send email"

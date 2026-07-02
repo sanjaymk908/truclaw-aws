@@ -3,13 +3,33 @@ AgentCore Gateway REQUEST interceptor — the native "before-tool-call hook".
 
 *** REMAINING VERIFICATION NEEDED ***
 The request/tool-call event shape (`_parse_gateway_event`) is now confirmed
-against a real invocation, not guessed -- see docs/ARCHITECTURE.md. Two
-things are still unverified: (1) identity extraction (`context.identity`)
-has only been observed as null, on a non-authenticated `initialize` call --
-not yet confirmed against a real authenticated `tools/call`; (2)
-`_gateway_response`'s ALLOW/DENY shape hasn't been independently confirmed
-as correct by AWS docs, only inferred from the fact that real calls made it
-this far without the Gateway itself rejecting the response shape.
+against a real invocation, not guessed -- see docs/ARCHITECTURE.md. One
+thing is still unverified: identity extraction (`context.identity`) has
+only been observed as null, on a non-authenticated `initialize` call -- not
+yet confirmed against a real authenticated `tools/call`.
+
+The response shape below was previously WRONG -- an invented
+`{"action": "ALLOW"|"DENY"}` payload that isn't AWS's actual contract at
+all. Confirmed live: the Gateway rejected it with "Received invalid
+response from interceptor". The real contract (confirmed against
+https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html,
+official docs, not inferred) has no allow/deny verb. A REQUEST interceptor
+must return one of:
+  - `mcp.transformedGatewayRequest.body` -- the (optionally modified)
+    JSON-RPC request body. Returning this lets the Gateway proceed to call
+    the target. ALLOW = return the original body unchanged.
+  - `mcp.transformedGatewayResponse` (`statusCode` + JSON-RPC `body`) --
+    short-circuits the call; the Gateway responds with this immediately and
+    never invokes the target ("If the interceptor output contains a
+    transformedGatewayResponse, the gateway will respond with that content
+    immediately, even if transformedGatewayRequest is also provided.").
+    DENY = synthesize a JSON-RPC error response ourselves, since there's no
+    native reject verb. The JSON-RPC error `code` used below (-32001) is a
+    best-effort choice within the implementation-defined server-error range
+    (-32000 to -32099 per the JSON-RPC 2.0 spec) -- AWS's docs don't show a
+    worked DENY/error example, so the exact code isn't independently
+    confirmed, only the envelope shape is.
+Both cases are wrapped in `{"interceptorOutputVersion": "1.0", "mcp": {...}}`.
 
 This replaces truclaw_adk's approach of monkey-patching ADK's
 `before_tool_callback` on the live agent tree (see the old protect.py /
@@ -92,8 +112,12 @@ def _parse_gateway_event(event: Dict[str, Any]) -> Dict[str, Any]:
     body = gateway_request.get("body") or {}
     method = body.get("method")
 
+    # `body` is carried through unconditionally -- both the passthrough
+    # (non-tool-call) and ALLOW paths need the original JSON-RPC body to
+    # echo back via transformedGatewayRequest, and the DENY path needs
+    # body.get("id") to build a well-formed JSON-RPC error response.
     if method != "tools/call":
-        return {"isToolCall": False, "method": method, "tool": None, "args": {}, "agentId": "unknown", "userId": "default"}
+        return {"isToolCall": False, "method": method, "tool": None, "args": {}, "agentId": "unknown", "userId": "default", "body": body}
 
     params = body.get("params") or {}
     tool = params.get("name")
@@ -109,15 +133,38 @@ def _parse_gateway_event(event: Dict[str, Any]) -> Dict[str, Any]:
     agent_id = identity.get("agentId") or identity.get("principalId") or "unknown"
     user_id = identity.get("userId") or identity.get("sessionUserId") or "default"
 
-    return {"isToolCall": True, "method": method, "tool": tool, "args": args, "agentId": agent_id, "userId": user_id}
+    return {"isToolCall": True, "method": method, "tool": tool, "args": args, "agentId": agent_id, "userId": user_id, "body": body}
 
 
-def _gateway_response(action: str, **extra) -> Dict[str, Any]:
-    """*** VERIFY AGAINST CURRENT DOCS *** — shape of what an interceptor
-    returns to allow, deny, or (via the escalation path) resolve a call.
-    `action` is one of "ALLOW" | "DENY".
-    """
-    return {"action": action, **extra}
+def _allow_response(request_body: Dict[str, Any]) -> Dict[str, Any]:
+    """Let the call proceed to the target, unmodified. Per AWS docs, ALLOW
+    is expressed by returning the original request body via
+    transformedGatewayRequest -- there's no separate allow verb."""
+    return {
+        "interceptorOutputVersion": "1.0",
+        "mcp": {"transformedGatewayRequest": {"body": request_body}},
+    }
+
+
+def _deny_response(request_body: Dict[str, Any], reason: str, **extra) -> Dict[str, Any]:
+    """Short-circuit the call with a synthesized JSON-RPC error, returned via
+    transformedGatewayResponse -- per AWS docs, this makes the Gateway
+    respond immediately without ever invoking the target. See module
+    docstring for the caveat on the exact JSON-RPC error `code` used here."""
+    req_id = request_body.get("id")
+    error_body = {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32001,
+            "message": reason or "Denied by TruClaw policy",
+            "data": {k: v for k, v in extra.items() if v is not None},
+        },
+    }
+    return {
+        "interceptorOutputVersion": "1.0",
+        "mcp": {"transformedGatewayResponse": {"statusCode": 200, "body": error_body}},
+    }
 
 
 def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -135,6 +182,7 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     log(f"[interceptor] RAW EVENT (diagnostic): {json.dumps(event, default=str)}")
 
     parsed = _parse_gateway_event(event)
+    request_body = parsed["body"]
 
     if not parsed["isToolCall"]:
         # Protocol-level MCP message (initialize, tools/list,
@@ -143,7 +191,7 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # ledger either; this isn't a tool-call decision, there's nothing
         # to audit.
         log(f"[interceptor] non-tool-call MCP method={parsed['method']}, passing through")
-        return _gateway_response("ALLOW")
+        return _allow_response(request_body)
 
     tool_name, tool_args = parsed["tool"], parsed["args"]
     agent_id, user_id = parsed["agentId"], parsed["userId"]
@@ -167,23 +215,23 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     if not decision.get("dangerous"):
         append_event({**base_event, "allowed": True, "approvalRequired": False})
-        return _gateway_response("ALLOW")
+        return _allow_response(request_body)
 
     if not config.ENFORCE:
         append_event({**base_event, "allowed": True, "approvalRequired": True, "enforce": False})
         log(f"[interceptor] dangerous but TRUCLAW_ENFORCE=0, allowing tool={tool_name}")
-        return _gateway_response("ALLOW")
+        return _allow_response(request_body)
 
     # ESCALATE — bounded wait via a Step Functions STANDARD execution, polled.
     approval = _escalate(decision, tool_name, tool_args, agent_id, user_id)
 
     if approval.get("approved"):
         append_event({**base_event, "allowed": True, "approvalRequired": True, "approval": approval})
-        return _gateway_response("ALLOW")
+        return _allow_response(request_body)
 
     append_event({**base_event, "allowed": False, "approvalRequired": True, "approval": approval})
-    return _gateway_response(
-        "DENY",
+    return _deny_response(
+        request_body,
         reason=approval.get("reason") or decision.get("reason"),
         actionTitle=decision.get("actionTitle"),
         actionBody=decision.get("actionBody"),
