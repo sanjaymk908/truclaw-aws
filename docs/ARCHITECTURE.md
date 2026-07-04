@@ -236,6 +236,60 @@ as a follow-up to fold Gateway + interceptor creation into
 script, for the same reason everything else in this repo is CDK-managed
 rather than click-ops or one-off CLI commands.
 
+### Open follow-up: CUSTOM_JWT (Cognito) inbound auth rejects a token that matches its own configured scope
+
+While testing Track A/B end-to-end, the Gateway's `CUSTOM_JWT` authorizer
+consistently returned `403 insufficient_scope` for every access token
+tried, including one that should unambiguously have satisfied the check:
+
+1. A Cognito Resource Server was created with a custom scope
+   (`truclaw/invoke`).
+2. A dedicated M2M app client was created with `client_credentials` grant
+   enabled and that scope allowed.
+3. The Gateway's `authorizerConfiguration.customJWTAuthorizer.allowedScopes`
+   was explicitly set to `["truclaw/invoke"]` (confirmed via
+   `get-gateway`, and confirmed propagated via the Gateway's own
+   `/.well-known/oauth-protected-resource` document showing
+   `"scopes_supported": ["truclaw/invoke"]`).
+4. A fresh access token was minted via the real OAuth `/oauth2/token`
+   endpoint (`grant_type=client_credentials`), decoded and confirmed to
+   carry `"token_use": "access"` and `"scope": "truclaw/invoke"` — an
+   exact match against the Gateway's own `allowedScopes`.
+5. That exact token, sent via raw `curl` directly to the Gateway's `/mcp`
+   endpoint (ruling out any client-library involvement), still got
+   `403` with `WWW-Authenticate: Bearer error="insufficient_scope",
+   scope="truclaw/invoke", ...` — the challenge header demanding the exact
+   scope the token already carried.
+
+Every lever documented in AWS's own inbound-auth and JWT-authorizer pages
+(`gateway-inbound-auth.html`, `inbound-jwt-authorizer.html`) was set up per
+the documented contract. This is either a genuine AgentCore platform bug or
+an unexplained interaction between Cognito's `client_credentials` token
+issuance and the Gateway's scope-matching logic — not something
+diagnosable from outside AWS's own systems. **Filed as an open item to
+raise with AWS support**, with the full repro (resource server config,
+token claims, exact curl request/response) preserved in this repo's
+session history.
+
+**Workaround used to unblock testing**: switched the Gateway's
+`authorizerType` from `CUSTOM_JWT` to `AWS_IAM` for the Track A/B test run.
+This only changes how the *test client* authenticates to the Gateway —
+none of TruClaw's actual logic (the interceptor, `danger.py`'s
+classification, the escalation state machine) sits upstream of or depends
+on which inbound auth type the Gateway uses, so this doesn't compromise
+what's being validated. Signing is done via AWS's own
+`mcp-proxy-for-aws` package (`aws_iam_streamablehttp_client`, service name
+`bedrock-agentcore`) rather than hand-rolled SigV4 — see
+`testing/echo_tool/test_client_iam.py`. Trade-off, per AWS's own docs
+on IAM vs. JWT+interceptor auth: `AWS_IAM` only supports
+Gateway-level authorization (`bedrock-agentcore:InvokeGateway` on the whole
+Gateway ARN), not tool-level access control per agent — for a production
+multi-agent deployment where different agents should see different tool
+sets, `CUSTOM_JWT` (once its scope bug is understood) or Cedar-based
+per-tool policy remains the right long-term answer. `AWS_IAM` is being
+used here purely as a testing workaround, not a proposed production
+architecture change.
+
 ## What's deliberately not built yet
 
 ### Priority follow-up: no path to surface business-logic failures to the end user

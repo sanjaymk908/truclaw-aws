@@ -56,11 +56,15 @@ async def main() -> None:
     token = sys.argv[1]
     which = sys.argv[2]
 
+    # AgentCore Gateway namespaces every tool as <targetName>___<toolName>
+    # (confirmed via a real tools/list response, see test_client_iam.py) --
+    # the bare tool names ("read"/"send_email") only exist inside each
+    # target's own schema, not as invokable names on the Gateway itself.
     if which in ("safe", "both"):
-        await call_tool(token, "read", "track A test")
+        await call_tool(token, "echo-safe___read", "track A test")
     if which in ("dangerous", "both"):
         print("\n(dangerous call will hang until you approve on your paired device, or it times out)")
-        await call_tool(token, "send_email", "track B test")
+        await call_tool(token, "echo-dangerous___send_email", "track B test")
 
 
 if __name__ == "__main__":
