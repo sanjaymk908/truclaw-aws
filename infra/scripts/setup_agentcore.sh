@@ -90,9 +90,11 @@ echo "   agentcore create --framework GoogleADK --type create ..."
 echo "   agentcore deploy"
 echo
 
-echo "7. Give the relay (device push service) the resume handler's Function"
-echo "   URL from the CDK stack output as its callback target for the"
-echo "   /verify-callback path used in escalation/send_challenge.py."
+echo "Step 7 (giving the relay a callback URL) has been removed -- it's"
+echo "unnecessary. The relay is poll-based, not webhook-based: the"
+echo "interceptor Lambda pushes the challenge and polls the relay for the"
+echo "result itself, inside its own invocation (see truclaw_aws/challenge.py"
+echo "and docs/ARCHITECTURE.md). Nothing needs to call back into AWS."
 echo
 echo "Steps 5-6 are the remaining unverified parts of this script -- confirm"
 echo "against your installed 'agentcore --help' output before running, same"

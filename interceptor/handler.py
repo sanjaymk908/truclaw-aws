@@ -45,30 +45,33 @@ Design (see docs/ARCHITECTURE.md for the full writeup):
      (danger.check_danger).
   3. ALLOW / DENY resolve immediately — this is the common case and stays
      synchronous and cheap.
-  4. ESCALATE hands off to a Step Functions STANDARD state machine (see
-     statemachine/escalation.asl.json) that sends the human challenge and
-     waits on a task token, bounded by TRUCLAW_CHALLENGE_TIMEOUT_SECONDS.
-     Standard, not Express: Express workflows don't support
-     .waitForTaskToken at all, which was discovered via a failed deploy —
-     see _escalate()'s docstring below for the resulting poll-based design.
-     Either way, the wait state lives in Step Functions (durable, externally
-     resumable by resume_handler.py) instead of an in-process dict + polling
-     thread, without requiring the Gateway itself to support
-     pausing/resuming a call — from the Gateway's point of view this
-     interceptor just took a bit longer and returned a normal decision.
+  4. ESCALATE calls truclaw_aws/challenge.py's send_challenge() directly and
+     awaits it, in this same Lambda invocation, bounded by
+     TRUCLAW_CHALLENGE_TIMEOUT_SECONDS (default 120s).
 
-     NOTE: this bounded-wait approach is the right fit as long as challenge
-     timeouts stay short (today's default: 120s). If the on-call/escalation
-     chain routing discussed as a follow-up ever needs a longer SLA than
-     that, this needs to move to a fully async "return pending, caller
-     retries" model instead — see docs/ARCHITECTURE.md, not solved here.
+     *** Rearchitected away from Step Functions (was over-engineered) ***
+     An earlier version of this routed ESCALATE through a Step Functions
+     STANDARD state machine + task-token callback pattern, on the
+     assumption that the push-notification relay would call back into an
+     AWS webhook when the device responded. That assumption was never
+     checked against the relay and turned out to be wrong: the relay is
+     poll-based (push a challenge, then poll for the result -- see
+     truclaw_aws/challenge.py's docstring and docs/ARCHITECTURE.md for the
+     full story, found via two rounds of live relay 400s and finally
+     reading truclaw_adk/challenge.py in full). Once `send_challenge()`
+     does the entire push-then-poll cycle itself, there's no unpredictable
+     external caller left to wait for durably -- the whole reason Step
+     Functions was there in the first place. Collapsed back to a direct
+     await, same shape as the original ADK's `before_tool_callback`: one
+     process, one push, one poll loop, one answer. No state machine, no
+     task token, no separate Lambda for this.
 """
 import asyncio
 import json
-import time
 from typing import Any, Dict
 
 from truclaw_aws import config
+from truclaw_aws.challenge import send_challenge
 from truclaw_aws.danger import check_danger
 from truclaw_aws.ledger import append_event
 from truclaw_aws.logging import log
@@ -167,10 +170,61 @@ def _deny_response(request_body: Dict[str, Any], reason: str, **extra) -> Dict[s
     }
 
 
+async def _decide(tool_name: str, tool_args: Any, agent_id: str, user_id: str) -> Dict[str, Any]:
+    """All the async work for one tool call, in one place so `handle()` only
+    needs a single `asyncio.run()` call: run the danger check, and if it
+    escalates, await send_challenge() directly (see module docstring for
+    why this replaced a Step Functions state machine)."""
+    decision = await check_danger(tool_name, tool_args, agent_id=agent_id, user_id=user_id)
+
+    base_event = {
+        "agentId": agent_id,
+        "userId": user_id,
+        "toolName": tool_name,
+        "toolArgs": tool_args,
+        "dangerous": decision.get("dangerous"),
+        "reason": decision.get("reason"),
+        "safeBypass": decision.get("safeBypass", False),
+        "thresholdViolation": decision.get("thresholdViolation", False),
+    }
+
+    if not decision.get("dangerous"):
+        append_event({**base_event, "allowed": True, "approvalRequired": False})
+        return {"allow": True}
+
+    if not config.ENFORCE:
+        append_event({**base_event, "allowed": True, "approvalRequired": True, "enforce": False})
+        log(f"[interceptor] dangerous but TRUCLAW_ENFORCE=0, allowing tool={tool_name}")
+        return {"allow": True}
+
+    approval = await send_challenge(
+        action_title=decision.get("actionTitle"),
+        action_body=decision.get("actionBody"),
+        reason=decision.get("reason"),
+        tool_name=tool_name,
+        tool_args=tool_args,
+        user_id=user_id,
+        timeout_seconds=config.CHALLENGE_TIMEOUT_SECONDS,
+    )
+
+    if approval.get("approved"):
+        append_event({**base_event, "allowed": True, "approvalRequired": True, "approval": approval})
+        return {"allow": True}
+
+    append_event({**base_event, "allowed": False, "approvalRequired": True, "approval": approval})
+    return {
+        "allow": False,
+        "reason": approval.get("reason") or decision.get("reason"),
+        "actionTitle": decision.get("actionTitle"),
+        "actionBody": decision.get("actionBody"),
+    }
+
+
 def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Lambda entrypoint. Synchronous by design — see module docstring for
-    why individual Lambda invocations stay synchronous even though the
-    overall escalation flow is async at the architecture level."""
+    """Lambda entrypoint. Synchronous by design from the Gateway's point of
+    view -- see module docstring for why this now stays a single Lambda
+    invocation end to end, including the escalation wait, instead of
+    handing off to a separate state machine."""
     # TEMPORARY DIAGNOSTIC — remove once _parse_gateway_event is verified
     # against a real invocation. Logs the complete raw event so the actual
     # Gateway interceptor payload shape can be read from CloudWatch Logs
@@ -198,120 +252,14 @@ def handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     log(f"[interceptor] tool={tool_name} agentId={agent_id} userId={user_id}")
 
-    decision = asyncio.run(
-        check_danger(tool_name, tool_args, agent_id=agent_id, user_id=user_id)
-    )
+    result = asyncio.run(_decide(tool_name, tool_args, agent_id, user_id))
 
-    base_event = {
-        "agentId": agent_id,
-        "userId": user_id,
-        "toolName": tool_name,
-        "toolArgs": tool_args,
-        "dangerous": decision.get("dangerous"),
-        "reason": decision.get("reason"),
-        "safeBypass": decision.get("safeBypass", False),
-        "thresholdViolation": decision.get("thresholdViolation", False),
-    }
-
-    if not decision.get("dangerous"):
-        append_event({**base_event, "allowed": True, "approvalRequired": False})
+    if result["allow"]:
         return _allow_response(request_body)
 
-    if not config.ENFORCE:
-        append_event({**base_event, "allowed": True, "approvalRequired": True, "enforce": False})
-        log(f"[interceptor] dangerous but TRUCLAW_ENFORCE=0, allowing tool={tool_name}")
-        return _allow_response(request_body)
-
-    # ESCALATE — bounded wait via a Step Functions STANDARD execution, polled.
-    approval = _escalate(decision, tool_name, tool_args, agent_id, user_id)
-
-    if approval.get("approved"):
-        append_event({**base_event, "allowed": True, "approvalRequired": True, "approval": approval})
-        return _allow_response(request_body)
-
-    append_event({**base_event, "allowed": False, "approvalRequired": True, "approval": approval})
     return _deny_response(
         request_body,
-        reason=approval.get("reason") or decision.get("reason"),
-        actionTitle=decision.get("actionTitle"),
-        actionBody=decision.get("actionBody"),
+        reason=result.get("reason"),
+        actionTitle=result.get("actionTitle"),
+        actionBody=result.get("actionBody"),
     )
-
-
-def _escalate(
-    decision: Dict[str, Any], tool_name: str, tool_args: Any, agent_id: str, user_id: str
-) -> Dict[str, Any]:
-    """Starts the escalation state machine and waits (bounded by
-    CHALLENGE_TIMEOUT_SECONDS + a small margin) for it to resolve.
-
-    This is a STANDARD state machine, not Express -- Express workflows
-    (including Express Sync) don't support the .waitForTaskToken pattern the
-    escalation flow depends on, which is a hard AWS platform limitation
-    discovered via an actual failed deploy, not a design choice. Standard
-    has no StartSyncExecution API, so instead of blocking on one synchronous
-    call, this starts the execution and polls DescribeExecution in a short
-    loop until it resolves or the deadline passes. Still synchronous from
-    the caller's (Gateway's) point of view -- this function doesn't return
-    until it has an answer or gives up -- just implemented as a poll against
-    Step Functions' own durable execution state instead of a single blocking
-    API call. See infra/cdk/truclaw_stack.py for the IAM side of this.
-    """
-    import boto3
-
-    if not config.ESCALATION_STATE_MACHINE_ARN:
-        log("[interceptor] no state machine configured; fail closed")
-        return {"approved": False, "reason": "escalation not configured"}
-
-    client = boto3.client("stepfunctions", region_name=config.AWS_REGION)
-    payload = {
-        "toolName": tool_name,
-        "toolArgs": tool_args,
-        "agentId": agent_id,
-        "userId": user_id,
-        "reason": decision.get("reason"),
-        "actionTitle": decision.get("actionTitle"),
-        "actionBody": decision.get("actionBody"),
-        "timeoutSeconds": config.CHALLENGE_TIMEOUT_SECONDS,
-    }
-
-    try:
-        resp = client.start_execution(
-            stateMachineArn=config.ESCALATION_STATE_MACHINE_ARN,
-            name=f"escalation-{int(time.time() * 1000)}",
-            input=json.dumps(payload),
-        )
-    except Exception as e:
-        log(f"[interceptor] failed to start escalation workflow: {e}")
-        return {"approved": False, "reason": f"escalation start failed: {e}"}
-
-    execution_arn = resp["executionArn"]
-    poll_interval_seconds = 2
-    deadline = time.time() + config.CHALLENGE_TIMEOUT_SECONDS + 10  # small margin over the state machine's own task timeout
-
-    while time.time() < deadline:
-        try:
-            desc = client.describe_execution(executionArn=execution_arn)
-        except Exception as e:
-            log(f"[interceptor] describe_execution error: {e}")
-            time.sleep(poll_interval_seconds)
-            continue
-
-        status = desc.get("status")
-        if status == "SUCCEEDED":
-            try:
-                return json.loads(desc["output"])
-            except Exception as e:
-                log(f"[interceptor] could not parse escalation output: {e}")
-                return {"approved": False, "reason": "unparseable escalation result"}
-        if status in ("FAILED", "TIMED_OUT", "ABORTED"):
-            log(f"[interceptor] escalation workflow ended status={status}")
-            return {"approved": False, "reason": f"escalation workflow {status.lower()}"}
-        # RUNNING -- keep polling
-        time.sleep(poll_interval_seconds)
-
-    log(f"[interceptor] escalation poll deadline reached, stopping execution {execution_arn}")
-    try:
-        client.stop_execution(executionArn=execution_arn, cause="TruClaw interceptor poll timeout")
-    except Exception as e:
-        log(f"[interceptor] stop_execution error (non-fatal): {e}")
-    return {"approved": False, "reason": "escalation timed out"}

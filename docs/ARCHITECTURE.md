@@ -21,7 +21,7 @@ agent behind the Gateway."
 
 | Original | This repo | Changed? |
 |---|---|---|
-| `config.py` | `truclaw_aws/config.py` | S3 bucket instead of GCS bucket; adds `ESCALATION_STATE_MACHINE_ARN` |
+| `config.py` | `truclaw_aws/config.py` | S3 bucket instead of GCS bucket |
 | `gcs_storage.py` | `truclaw_aws/s3_storage.py` | GCS -> S3; adds byte-level put/get/list helpers used by the per-object storage below |
 | `jwt_verify.py` | `truclaw_aws/jwt_verify.py` | Unchanged logic (pure crypto, no cloud dependency) |
 | `pairing.py` | `truclaw_aws/pairing.py` | **Redesigned**: one S3 object per paired device instead of one shared blob mutated on every pairing event — removes a read-modify-write race, see below |
@@ -29,7 +29,7 @@ agent behind the Gateway."
 | `policy.py` | `truclaw_aws/policy.py` | Same single-object-per-agent shape — policy edits are human-gated and infrequent, so there's no race to fix here |
 | `danger.py` | `truclaw_aws/danger.py` | Same three-question rubric and Gemini call; a Bedrock model swap is an unwired stub, not used by default |
 | `guardrail.py` + `protect.py` + `autopatch.py` | `interceptor/handler.py` | **Re-homed** from an ADK in-process monkeypatch to an AgentCore Gateway interceptor |
-| `challenge.py` | `escalation/send_challenge.py` + `escalation/resume_handler.py` + `statemachine/escalation.asl.json` | **Re-homed** from in-process polling (asyncio + a module-level dict) to a Step Functions callback (`waitForTaskToken`) |
+| `challenge.py` | `truclaw_aws/challenge.py` | Same push-then-poll logic against the relay, called directly (awaited) from `interceptor/handler.py` instead of ADK's module-level `PENDING` dict + `asyncio.to_thread`. (An earlier version of this port routed this through a Step Functions state machine + two extra Lambdas, on a wrong assumption about the relay being webhook-based — removed, see "The escalation design" below.) |
 | `cron_aggregator.py` (a Cloud Run Job) | `aggregator/handler.py` (an EventBridge-scheduled Lambda) | Same aggregation logic, reads the new per-event ledger objects |
 | `admin_cli.py` | `admin/cli.py` | Same commands, S3-backed |
 | `chat_handler.py`, `pair_route.py`, original `cli.py` | *(not ported)* | FastAPI/Google-Chat-specific glue, out of scope for the Gateway-interceptor design |
@@ -59,39 +59,104 @@ to race there.
 
 ## The escalation design
 
-Common case (allow/deny) stays synchronous and cheap — no Step Functions
-involved. Only when a call needs human sign-off does the interceptor start
-a **Step Functions STANDARD** execution (`statemachine/escalation.asl.json`)
-that sends the push notification and waits on a task token, bounded by
-`TRUCLAW_CHALLENGE_TIMEOUT_SECONDS` (default 120s). The wait state lives in
-Step Functions, not in a Lambda's memory — any warm or cold
-`resume_handler.py` invocation can resolve any pending approval, because
-the task token, not local process state, is what Step Functions uses to
-find the paused execution.
+Common case (allow/deny) is synchronous and cheap: `check_danger()` runs,
+returns a verdict, done. When a call needs human sign-off, the interceptor
+calls `truclaw_aws/challenge.py:send_challenge()` and awaits it directly,
+in the same Lambda invocation — no separate infrastructure, no state
+machine, no second Lambda. One process, one push, one poll loop, one
+answer, matching `truclaw_adk/challenge.py`'s original shape almost
+exactly.
 
-Standard, not Express: this started out as an Express Sync execution
-(bounded, blocking, cheap), which would have been the simpler design. It
-doesn't work — Express workflows, sync or async, don't support the
-`.waitForTaskToken` integration pattern at all, which came back as a
-`CREATE_FAILED` / `SCHEMA_VALIDATION_FAILED` error on an actual deploy, not
-something caught in review. Standard is the only state machine type that
-supports pausing on a task token, which the whole escalation flow depends
-on. The cost of that: Standard has no `StartSyncExecution` API, so
-`interceptor/handler.py:_escalate()` starts the execution with
-`StartExecution` and polls `DescribeExecution` in a short loop (2s
-interval) until it resolves or the deadline passes, rather than blocking on
-one synchronous call. Still synchronous from the Gateway's point of view —
-the interceptor doesn't return until it has an answer — just implemented as
-a poll against Step Functions' own durable execution state instead of an
-API that turned out not to support this pattern.
+It wasn't built this way the first time. Worth documenting the path here
+in full, since it's a real example of a mistake worth not repeating: this
+project had full read access to `truclaw_adk`'s working implementation
+from the start, and the escalation design was nonetheless built from
+scratch as a fresh "what's idiomatic on AWS" exercise, rather than as a
+port of code that already worked.
 
-This bounded-wait design (Standard + poll, capped around 130s including
-margin) is a fit for short challenge windows. It stops being a fit if
-approvals ever need a longer SLA (e.g. routed to an on-call rotation
-instead of an account owner's phone) — that would need a fully async
-"return pending, caller retries" model instead. Not built here; the seam
-for it is that only `escalation/send_challenge.py` would need to change,
-not the interceptor's overall shape or the state machine.
+### What was built first, and why it was wrong
+
+The first version routed escalation through a **Step Functions STANDARD**
+state machine using the `.waitForTaskToken` callback pattern:
+`interceptor/handler.py` started an execution and polled
+`DescribeExecution`; a separate `escalation/send_challenge.py` Lambda,
+invoked as the state machine's one task, sent the push notification; and a
+third Lambda, `escalation/resume_handler.py`, sat behind a Function URL
+waiting for the relay to call back with the device's signed response and
+resolve the task token via `SendTaskSuccess`/`SendTaskFailure`.
+
+That whole design rested on one assumption that was never checked: that
+the relay could be handed an arbitrary caller-supplied `webhookURL` and
+would call back into that Function URL when the device responded. Live
+testing surfaced this the hard way, in stages — a `400 missing nonce`,
+then (after guessing a fix) a `400 missing sessionId`, where the "fix" was
+itself another guess (`sessionId` set to the device's *pairing* composite
+key) rather than a check against the source. Two rounds of guessing off
+relay error strings, when the actual answer was sitting in a file this
+project already had full access to.
+
+Reading `truclaw_adk/challenge.py` in full (not excerpted, not
+paraphrased from memory) finally showed the real contract. `_send_and_poll`
+sends:
+
+```python
+payload = {
+    "fcmToken": fcm_token, "nonce": nonce, "timestamp": timestamp, "salt": salt,
+    "sessionId": challenge_session_id,   # sha256(nonce+timestamp)[:16] -- fresh per challenge
+    "webhookURL": f"{RELAY_URL}/verify/{challenge_session_id}",  # the RELAY's own endpoint
+    "action": action_title, "actionTitle": action_title, "actionBody": action_body,
+}
+```
+
+`webhookURL` points at the relay's *own* `/verify/{sessionId}` endpoint —
+that's where the OpenClaw app posts its signed JWT. It was never
+configurable to point at a third party. The caller (the original ADK
+app, via a background-thread poll loop called `_sync_poll`) discovers the
+result by polling `{RELAY_URL}/poll/{sessionId}` itself, in a loop, until
+it sees one. Nothing ever calls the caller back. Simple push, simple poll,
+one process, no rocket science — exactly as it should be for what this
+actually needs to do.
+
+### The fix: collapse back to that shape
+
+Once that was understood, the entire Step Functions layer was revealed as
+solving a problem that never existed: there was no unpredictable external
+caller needing a durable, resumable-by-anyone wait state, because nothing
+was ever going to call back externally in the first place. `truclaw_aws/
+challenge.py` now does the full push-then-poll cycle itself — copied
+field-for-field from the original (`nonce`, `timestamp`, `salt`,
+`sessionId` as a fresh `sha256(nonce+timestamp)[:16]`, not the device's
+pairing key), using asyncio instead of a background thread (nothing else
+runs concurrently inside a Lambda invocation, so the original's reason for
+threading the poll loop off the main event loop doesn't apply) — and
+`interceptor/handler.py` just calls and awaits it directly, inside its own
+existing 180s timeout headroom. Bounded by
+`TRUCLAW_CHALLENGE_TIMEOUT_SECONDS` (default 120s) either way.
+
+Removed entirely: the Step Functions state machine, `escalation/
+send_challenge.py`, `escalation/resume_handler.py` and its Function URL,
+and every associated IAM grant (`states:StartExecution`,
+`DescribeExecution`, `StopExecution`, `SendTaskSuccess`, `SendTaskFailure`,
+`SendTaskHeartbeat`). The interceptor Lambda needs no Step Functions
+permissions at all now. `escalation/` and `statemachine/`'s files are
+left in the repo (not physically deletable from this environment) but are
+fully dead — a cleanup follow-up to actually remove them once this design
+has run stable for a while.
+
+### Why this matters beyond just this one bug
+
+This is the same failure mode that showed up elsewhere this session:
+inventing the Gateway interceptor's response shape instead of checking
+AWS's docs, guessing at Cedar's role instead of researching how real
+fraud/risk systems split authorization from risk decisioning, suggesting
+AG-UI for escalation instead of confirming it against TruClaw's actual
+out-of-band security requirement. In every case, the fix came from
+checking ground truth (official docs, a live test, or — here — code that
+already existed and already worked); the mistake came from designing off
+an assumption dressed up as engineering judgment. The lesson worth
+carrying forward for anything still left to build in this repo: **read
+the original before designing its replacement**, even when — especially
+when — the replacement feels like it should be straightforward.
 
 ## Cedar / AgentCore Policy — kept deliberately separate
 
@@ -336,22 +401,20 @@ action being approved defeats the purpose of an independent check.
 
 - **Cedar-based coarse authorization** (see above) — a real hardening
   step, scoped separately from this repo's risk-decisioning logic.
-- **On-call / escalation-chain routing.** `escalation/send_challenge.py`
+- **On-call / escalation-chain routing.** `truclaw_aws/challenge.py`
   pushes to the account owner's own paired device(s) only. Swapping this
   for an ops/compliance on-call queue only requires changing that one
-  function — the state machine and interceptor don't know or care what
-  "ask a human" means underneath.
+  module — the interceptor doesn't know or care what "ask a human" means
+  underneath.
 - **A Bedrock-hosted classifier model.** `danger.py` keeps calling Gemini
   directly. `_bedrock_generate` is a stub, not wired in, not exercised
   against a live endpoint.
-- **Step Functions Catch/Denied inconsistency.** The standalone reference
-  `statemachine/escalation.asl.json` has an explicit `Catch` → `Denied`
-  state for a clean timeout output; the actual CDK-deployed construct in
-  `infra/cdk/truclaw_stack.py` doesn't have the equivalent wired in.
-  Harmless today because `interceptor/handler.py`'s poll loop
-  independently treats any non-SUCCEEDED terminal execution status as a
-  deny, but worth reconciling for consistency between the reference file
-  and what's actually deployed.
+- **Delete the dead Step Functions-era files.** `escalation/send_challenge.py`,
+  `escalation/resume_handler.py`, and `statemachine/escalation.asl.json`
+  are fully superseded by `truclaw_aws/challenge.py` and no longer
+  referenced by `infra/cdk/truclaw_stack.py` at all — they just couldn't
+  be physically deleted from the environment that made this change. Safe
+  to `rm` outright; nothing imports or deploys them anymore.
 
 ## Cost detail
 

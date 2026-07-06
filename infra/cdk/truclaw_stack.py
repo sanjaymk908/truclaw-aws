@@ -1,16 +1,32 @@
 """
-CDK stack for the "classic" AWS resources: S3, Lambda, Step Functions, IAM,
-EventBridge. This does NOT create the AgentCore Gateway, Runtime, or
-Identity resources -- CDK L2 support for AgentCore is not mature enough at
-the time of writing to trust generated constructs for it, and getting the
-Gateway interceptor wiring right matters more than saving a few manual
-steps. See infra/scripts/setup_agentcore.sh for that half, using the
-`agentcore` CLI (aws/bedrock-agentcore-starter-toolkit) instead.
+CDK stack for the "classic" AWS resources: S3, Lambda, EventBridge. This
+does NOT create the AgentCore Gateway, Runtime, or Identity resources --
+CDK L2 support for AgentCore is not mature enough at the time of writing
+to trust generated constructs for it, and getting the Gateway interceptor
+wiring right matters more than saving a few manual steps. See
+infra/scripts/setup_agentcore.sh for that half, using the `agentcore` CLI
+(aws/bedrock-agentcore-starter-toolkit) instead.
+
+*** No more Step Functions ***
+This stack used to also provision a Step Functions STANDARD state machine
+plus two extra Lambdas (SendChallengeFunction as its task, and
+ResumeHandlerFunction behind a Function URL) for a task-token callback
+pattern. That was built on an unverified assumption -- that the push
+relay would call back into an AWS webhook when a device responded -- which
+turned out to be wrong: the relay is poll-based (push a challenge, poll
+for the result, same caller does both), confirmed by reading
+truclaw_adk/challenge.py in full after two rounds of live relay 400s. Once
+the escalation logic (now truclaw_aws/challenge.py) does that whole
+push-then-poll cycle itself inside the interceptor's own Lambda
+invocation, there's no unpredictable external caller left needing a
+durable, resumable-by-anyone wait state -- the entire reason Step
+Functions was there. Removed. See docs/ARCHITECTURE.md for the full story
+and interceptor/handler.py's module docstring for the resulting design.
 
 Deployment order: `cdk deploy` this stack first (it has no AgentCore
-dependency), note the outputs (bucket name, Lambda ARNs, state machine ARN,
-resume handler Function URL), then run setup_agentcore.sh with those values
-to wire the Gateway interceptor to the interceptor Lambda's ARN.
+dependency), note the outputs (bucket name, interceptor Lambda ARN), then
+run setup_agentcore.sh with those values to wire the Gateway interceptor
+to the interceptor Lambda's ARN.
 """
 import os
 
@@ -18,9 +34,6 @@ from aws_cdk import (
     Stack, Duration, CfnOutput, BundlingOptions, DockerImage,
     aws_s3 as s3,
     aws_lambda as lambda_,
-    aws_iam as iam,
-    aws_stepfunctions as sfn,
-    aws_stepfunctions_tasks as tasks,
     aws_events as events,
     aws_events_targets as targets,
 )
@@ -59,10 +72,14 @@ class TruClawStack(Stack):
                 command=[
                     "bash", "-c",
                     "pip install -r requirements.txt -t /asset-output && "
-                    "cp -au truclaw_aws interceptor escalation aggregator admin /asset-output/",
+                    "cp -au truclaw_aws interceptor aggregator admin /asset-output/",
                 ],
             ),
         )
+        # escalation/ deliberately excluded -- both its Lambdas
+        # (send_challenge.py, resume_handler.py) are superseded by
+        # truclaw_aws/challenge.py, called directly from interceptor_fn.
+        # See this file's module docstring.
 
         # NOTE: AWS_REGION is deliberately not set here -- Lambda's runtime
         # injects it automatically, and CDK/CloudFormation will reject an
@@ -113,42 +130,25 @@ class TruClawStack(Stack):
         }
 
         # --- Interceptor Lambda: the actual before-tool-call hook ---
+        # timeout=180s: needs headroom over TRUCLAW_CHALLENGE_TIMEOUT_SECONDS
+        # (120s default), since this single Lambda invocation now does the
+        # entire escalation push-then-poll cycle itself (truclaw_aws/
+        # challenge.py, called directly from interceptor/handler.py) rather
+        # than handing off to separate infrastructure. See this file's and
+        # interceptor/handler.py's module docstrings for why that's now the
+        # design, instead of Step Functions.
         interceptor_fn = lambda_.Function(
             self, "InterceptorFunction",
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="interceptor.handler.handle",
             code=code_asset,
-            # Needs headroom over CHALLENGE_TIMEOUT_SECONDS (120s default) since
-            # _escalate() polls DescribeExecution rather than blocking on a
-            # single synchronous call -- see interceptor/handler.py.
             timeout=Duration.seconds(180),
             memory_size=256,
-            environment={**common_env, **optional_env, "GOOGLE_API_KEY": google_api_key},
-        )
-
-        # --- send_challenge Task Lambda (invoked by the state machine) ---
-        send_challenge_fn = lambda_.Function(
-            self, "SendChallengeFunction",
-            runtime=lambda_.Runtime.PYTHON_3_12,
-            handler="escalation.send_challenge.handle",
-            code=code_asset,
-            timeout=Duration.seconds(30),
-            memory_size=128,
-            environment={**common_env, "TRUKYC_RELAY_URL": relay_url},
-        )
-
-        # --- resume_handler Lambda, fronted by a Function URL the relay calls ---
-        resume_fn = lambda_.Function(
-            self, "ResumeHandlerFunction",
-            runtime=lambda_.Runtime.PYTHON_3_12,
-            handler="escalation.resume_handler.handle",
-            code=code_asset,
-            timeout=Duration.seconds(15),
-            memory_size=128,
-            environment=common_env,
-        )
-        resume_url = resume_fn.add_function_url(
-            auth_type=lambda_.FunctionUrlAuthType.NONE,  # the JWT in the body is the auth
+            environment={
+                **common_env, **optional_env,
+                "GOOGLE_API_KEY": google_api_key,
+                "TRUKYC_RELAY_URL": relay_url,
+            },
         )
 
         # --- aggregator Lambda, on an hourly EventBridge schedule ---
@@ -167,93 +167,8 @@ class TruClawStack(Stack):
             targets=[targets.LambdaFunction(aggregator_fn)],
         )
 
-        for fn in (interceptor_fn, send_challenge_fn, resume_fn, aggregator_fn):
+        for fn in (interceptor_fn, aggregator_fn):
             bucket.grant_read_write(fn)
-
-        # --- Step Functions state machine (escalation workflow) ---
-        #
-        # STANDARD, not Express: Express workflows (including Express Sync)
-        # do not support the .waitForTaskToken integration pattern at all --
-        # confirmed the hard way, via a CREATE_FAILED deploy
-        # (SCHEMA_VALIDATION_FAILED) rather than caught in review. Standard
-        # is the only state machine type that supports pausing on a task
-        # token, which is the whole mechanism the escalation flow depends
-        # on. The tradeoff: Standard has no StartSyncExecution API, so the
-        # interceptor Lambda can't block on a single synchronous call the
-        # way Express Sync would have let it -- it starts the execution
-        # async and polls DescribeExecution in a short bounded loop instead
-        # (see interceptor/handler.py:_escalate). Still synchronous from the
-        # Gateway's point of view, still bounded by the same timeout -- just
-        # polling Step Functions' own durable execution state rather than
-        # blocking on an API that turned out not to exist for this pattern.
-        send_challenge_task = tasks.LambdaInvoke(
-            self, "SendChallengeTask",
-            lambda_function=send_challenge_fn,
-            integration_pattern=sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
-            payload=sfn.TaskInput.from_object({
-                "Token": sfn.JsonPath.task_token,
-                "payload": sfn.JsonPath.entire_payload,
-            }),
-            task_timeout=sfn.Timeout.duration(Duration.seconds(150)),
-        )
-
-        state_machine = sfn.StateMachine(
-            self, "EscalationStateMachine",
-            state_machine_type=sfn.StateMachineType.STANDARD,
-            definition_body=sfn.DefinitionBody.from_chainable(send_challenge_task),
-            timeout=Duration.minutes(4),
-        )
-
-        interceptor_fn.add_environment(
-            "TRUCLAW_ESCALATION_STATE_MACHINE_ARN", state_machine.state_machine_arn
-        )
-        state_machine.grant_start_execution(interceptor_fn)
-        state_machine.grant_task_response(resume_fn)
-        # send_challenge_fn also calls SendTaskFailure directly (no-paired-
-        # device / push-delivery-failed paths in send_challenge.py) -- this
-        # grant was missing entirely, found via a live test that surfaced a
-        # real AccessDeniedException on states:SendTaskFailure rather than
-        # something caught in review.
-        #
-        # NOT using grant_task_response() here like resume_fn above: that
-        # scopes the IAM policy to this specific state_machine_arn, which
-        # creates a real circular dependency (found via an actual `cdk
-        # deploy` failure, not predicted) -- send_challenge_fn is the Lambda
-        # the state machine's LambdaInvoke task directly targets, so the
-        # state machine already depends on send_challenge_fn; scoping this
-        # grant to the state machine's ARN makes send_challenge_fn's role
-        # policy depend back on the state machine, a cycle. resume_fn never
-        # hit this because the state machine doesn't reference resume_fn at
-        # all. This is also the more technically correct shape regardless:
-        # SendTaskSuccess/SendTaskFailure/SendTaskHeartbeat don't support
-        # resource-level scoping to a specific state machine ARN in IAM --
-        # authorization is via the opaque task token itself, not the ARN --
-        # so AWS's own example policies for the callback pattern use
-        # Resource: "*" for these three actions.
-        send_challenge_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "states:SendTaskSuccess",
-                    "states:SendTaskFailure",
-                    "states:SendTaskHeartbeat",
-                ],
-                resources=["*"],
-            )
-        )
-        # grant_start_execution doesn't cover DescribeExecution/StopExecution
-        # (they're scoped to execution ARNs, not the state machine ARN) --
-        # the interceptor needs both for its poll loop.
-        interceptor_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["states:DescribeExecution", "states:StopExecution"],
-                resources=[
-                    f"arn:aws:states:{self.region}:{self.account}:execution:"
-                    f"{state_machine.state_machine_name}:*"
-                ],
-            )
-        )
 
         CfnOutput(self, "BucketName", value=bucket.bucket_name)
         CfnOutput(self, "InterceptorFunctionArn", value=interceptor_fn.function_arn)
-        CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
-        CfnOutput(self, "ResumeHandlerUrl", value=resume_url.url)

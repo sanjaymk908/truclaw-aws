@@ -62,8 +62,11 @@ pip install -r requirements.txt
 
 **2. Deploy the AWS infrastructure**
 
-This creates the S3 bucket, the four Lambda functions, and the Step
-Functions approval workflow.
+This creates the S3 bucket and the two Lambda functions (the interceptor
+and the hourly aggregator). Approvals are handled directly inside the
+interceptor itself — it pushes the challenge to your relay and polls for
+the human's response in the same invocation, so there's no separate
+approval-workflow infrastructure to provision or wire up.
 
 ```
 cd infra/cdk
@@ -72,15 +75,13 @@ cdk bootstrap    # first time only, per AWS account/region
 cdk deploy
 ```
 
-Copy down the four values `cdk deploy` prints at the end — you'll need
-them in the next two steps:
+Copy down the two values `cdk deploy` prints at the end — you'll need them
+in the next step:
 
 | Output | What it's for |
 |---|---|
 | `BucketName` | Where policies, the audit log, and device pairings live |
 | `InterceptorFunctionArn` | The Lambda that makes allow/block/escalate decisions |
-| `StateMachineArn` | The approval workflow (set automatically on the interceptor — you won't need to touch this) |
-| `ResumeHandlerUrl` | Where your push-notification relay sends approval responses |
 
 **3. Connect TruClaw to AgentCore**
 
@@ -96,16 +97,11 @@ agent's tools with it, and attaching TruClaw as the Gateway's request
 interceptor. It prints the commands rather than running them silently, so
 you can confirm each one — see the script's own comments for details.
 
-**4. Wire up approvals**
-
-Point your push-notification relay's callback at the `ResumeHandlerUrl`
-from step 2, so approval responses make it back to TruClaw.
-
-**5. Write your first policy**
+**4. Write your first policy**
 
 See "Configuring what's safe and what's dangerous" below.
 
-**6. Confirm it's working**
+**5. Confirm it's working**
 
 See "Verify your install" below.
 
@@ -167,11 +163,13 @@ Trigger a few test tool calls through your agent and confirm:
 ## Admin commands
 
 ```
-python -m admin.cli view-ledger  --agent-id <id> [--limit N]   # inspect recent decisions
-python -m admin.cli view-memory  --agent-id <id>                # inspect the behavioral summary
-python -m admin.cli clear-ledger --agent-id <id>                # wipe the audit log
-python -m admin.cli clear-memory --agent-id <id>                # wipe the behavioral summary
-python -m admin.cli clear-all    --agent-id <id>                # both
+python -m admin.cli view-ledger   --agent-id <id> [--limit N]   # inspect recent decisions
+python -m admin.cli view-memory   --agent-id <id>                # inspect the behavioral summary
+python -m admin.cli clear-ledger  --agent-id <id>                # wipe the audit log
+python -m admin.cli clear-memory  --agent-id <id>                # wipe the behavioral summary
+python -m admin.cli clear-all     --agent-id <id>                # both
+python -m admin.cli pair-device   --user-id <id> [--timeout N]   # pair a device (prints a link/QR)
+python -m admin.cli list-devices  --user-id <id>                 # list paired devices
 ```
 
 All admin commands require `TRUCLAW_ADMIN_KEY` (matched against a hash your

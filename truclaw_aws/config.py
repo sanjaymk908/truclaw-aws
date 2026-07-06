@@ -34,8 +34,5 @@ PAIR_POLL_TIMEOUT_SECONDS = int(os.getenv("TRUCLAW_PAIR_POLL_TIMEOUT_SECONDS", "
 CHALLENGE_TIMEOUT_SECONDS = int(os.getenv("TRUCLAW_CHALLENGE_TIMEOUT_SECONDS", "120"))
 ENFORCE = os.getenv("TRUCLAW_ENFORCE", "1") not in {"0", "false", "False", "no"}
 
-# --- Step Functions (async escalation — see statemachine/escalation.asl.json) ---
-ESCALATION_STATE_MACHINE_ARN = os.getenv("TRUCLAW_ESCALATION_STATE_MACHINE_ARN", "")
-
 # --- Admin ---
 ADMIN_KEY_HASH = os.getenv("TRUCLAW_ADMIN_KEY_HASH", "")
