@@ -214,7 +214,32 @@ class TruClawStack(Stack):
         # grant was missing entirely, found via a live test that surfaced a
         # real AccessDeniedException on states:SendTaskFailure rather than
         # something caught in review.
-        state_machine.grant_task_response(send_challenge_fn)
+        #
+        # NOT using grant_task_response() here like resume_fn above: that
+        # scopes the IAM policy to this specific state_machine_arn, which
+        # creates a real circular dependency (found via an actual `cdk
+        # deploy` failure, not predicted) -- send_challenge_fn is the Lambda
+        # the state machine's LambdaInvoke task directly targets, so the
+        # state machine already depends on send_challenge_fn; scoping this
+        # grant to the state machine's ARN makes send_challenge_fn's role
+        # policy depend back on the state machine, a cycle. resume_fn never
+        # hit this because the state machine doesn't reference resume_fn at
+        # all. This is also the more technically correct shape regardless:
+        # SendTaskSuccess/SendTaskFailure/SendTaskHeartbeat don't support
+        # resource-level scoping to a specific state machine ARN in IAM --
+        # authorization is via the opaque task token itself, not the ARN --
+        # so AWS's own example policies for the callback pattern use
+        # Resource: "*" for these three actions.
+        send_challenge_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "states:SendTaskSuccess",
+                    "states:SendTaskFailure",
+                    "states:SendTaskHeartbeat",
+                ],
+                resources=["*"],
+            )
+        )
         # grant_start_execution doesn't cover DescribeExecution/StopExecution
         # (they're scoped to execution ARNs, not the state machine ARN) --
         # the interceptor needs both for its poll loop.
