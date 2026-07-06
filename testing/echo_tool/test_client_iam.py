@@ -32,10 +32,21 @@ Prerequisites (see README.md / ARCHITECTURE.md for the full commands):
 
 Usage:
   pip install mcp mcp-proxy-for-aws
-  python3 test_client_iam.py <safe|dangerous|both>
+  python3 test_client_iam.py <safe|dangerous|both> [agent-id]
 
 No bearer token needed -- auth comes from whatever AWS credentials are
 active in the environment (profile, env vars, or instance/role credentials).
+
+agent-id (optional, defaults to "test-agent-a") is the calling agent's own
+declared identity -- passed as MCP's standard per-request `_meta.agentId`
+field on every tools/call (see interceptor/handler.py's `_parse_gateway_event`
+for why this replaced deriving agentId from the caller's IAM principal: IAM
+identity answers "who is authenticating", not "which agent is this", and a
+fleet of agents sharing one execution role would otherwise all collapse
+into a single agentId). Run this script twice with two different agent-ids
+to see two distinct agentId values in the logs/ledger, e.g.:
+  python3 test_client_iam.py safe agentA
+  python3 test_client_iam.py safe agentB
 """
 import asyncio
 import sys
@@ -52,8 +63,8 @@ GATEWAY_URL = "https://truclawgw-iam-test-x8ubuihr18.gateway.bedrock-agentcore.u
 AWS_REGION = "us-east-1"
 
 
-async def call_tool(tool_name: str, message: str) -> None:
-    print(f"\n=== Calling tool: {tool_name} ===")
+async def call_tool(tool_name: str, message: str, agent_id: str) -> None:
+    print(f"\n=== Calling tool: {tool_name} (agentId={agent_id}) ===")
     async with aws_iam_streamablehttp_client(
         endpoint=GATEWAY_URL,
         aws_service="bedrock-agentcore",
@@ -75,17 +86,25 @@ async def call_tool(tool_name: str, message: str) -> None:
             tools = await session.list_tools()
             print(f"tools visible on gateway: {[t.name for t in tools.tools]}")
 
-            print(f"calling {tool_name}({{'message': {message!r}}}) ...")
-            result = await session.call_tool(tool_name, {"message": message})
+            print(f"calling {tool_name}({{'message': {message!r}}}) with agentId={agent_id!r} ...")
+            # meta -> serialized as the JSON-RPC request's params._meta (MCP's
+            # standard out-of-band metadata field, confirmed via mcp SDK's
+            # ClientSession.call_tool / RequestParams.Meta, which allows
+            # arbitrary extra keys) -- kept fully separate from `arguments`
+            # so it never touches the tool's own parameter schema.
+            result = await session.call_tool(
+                tool_name, {"message": message}, meta={"agentId": agent_id}
+            )
             print(f"result: {result}")
 
 
 async def main() -> None:
     if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} <safe|dangerous|both>")
+        print(f"usage: {sys.argv[0]} <safe|dangerous|both> [agent-id]")
         sys.exit(1)
 
     which = sys.argv[1]
+    agent_id = sys.argv[2] if len(sys.argv) > 2 else "test-agent-a"
 
     # AgentCore Gateway namespaces every tool as <targetName>___<toolName>
     # (confirmed via a real tools/list response: ['echo-dangerous___send_email',
@@ -95,10 +114,10 @@ async def main() -> None:
     # the Gateway's own routing, *after* the interceptor has already allowed
     # the call -- this tripped up the first real test run.
     if which in ("safe", "both"):
-        await call_tool("echo-safe___read", "track A test")
+        await call_tool("echo-safe___read", "track A test", agent_id)
     if which in ("dangerous", "both"):
         print("\n(dangerous call will hang until you approve on your paired device, or it times out)")
-        await call_tool("echo-dangerous___send_email", "track B test")
+        await call_tool("echo-dangerous___send_email", "track B test", agent_id)
 
 
 if __name__ == "__main__":

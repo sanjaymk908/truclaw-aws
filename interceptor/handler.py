@@ -2,13 +2,22 @@
 AgentCore Gateway REQUEST interceptor — the native "before-tool-call hook".
 
 The request/tool-call event shape (`_parse_gateway_event`) is confirmed
-against real invocations, not guessed -- see docs/ARCHITECTURE.md. Identity
-extraction (`context.identity`) is now also confirmed against a real
-authenticated `tools/call` on the AWS_IAM test Gateway: it's
-`{"awsPrincipalArn": "arn:..."}`, not the agentId/principalId/userId/
-sessionUserId fields originally guessed (those were never observed in any
-real event). agent_id now derives from the ARN; see `_parse_gateway_event`
-for the reasoning on user_id staying separate.
+against real invocations, not guessed -- see docs/ARCHITECTURE.md.
+
+*** agent_id is no longer derived from IAM/network identity ***
+An earlier version derived agent_id from `context.identity.awsPrincipalArn`
+(the calling IAM principal). That was wrong the same way the earlier Step
+Functions detour was wrong: a plausible-sounding platform-idiomatic guess
+that was never checked against what the original ADK implementation
+actually did. It read the developer-declared `LlmAgent(name=...)` off the
+in-process agent object (truclaw_adk/guardrail.py:_root_agent_id) -- an
+application-level identity the agent chooses for itself, completely
+unrelated to auth. A fleet of AWS agents sharing one execution role/IAM
+identity (normal on AWS) would have collapsed into one shared agentId,
+silently merging their policies and ledgers. Fixed: agent_id is now read
+from the agent's own declared value in MCP's standard per-request `_meta`
+field (`params._meta.agentId`), with the old IAM-derived value kept only as
+a fallback. See `_parse_gateway_event` for the exact code.
 
 The response shape below was previously WRONG -- an invented
 `{"action": "ALLOW"|"DENY"}` payload that isn't AWS's actual contract at
@@ -128,23 +137,37 @@ def _parse_gateway_event(event: Dict[str, Any]) -> Dict[str, Any]:
     tool = params.get("name")
     args = params.get("arguments") or {}
 
-    # Identity: confirmed live against a real authenticated tools/call on the
-    # AWS_IAM test Gateway -- the actual shape is
-    #   context.identity == {"awsPrincipalArn": "arn:aws:iam::<acct>:user/<name>"}
-    # not agentId/principalId/userId/sessionUserId as originally guessed
-    # (those fields were never observed in any real event; they were an
-    # assumption carried over from the CUSTOM_JWT design before this was
-    # verified). AWS_IAM auth identifies the calling IAM principal, not a
-    # human end user -- there is no separate "who gets paged" field in it,
-    # so agent_id is derived from the ARN (falls back through the older
-    # guessed fields in case a CUSTOM_JWT gateway's shape ever differs) and
-    # user_id is left alone, since device-pairing identity is unrelated to
-    # the IAM principal invoking the Gateway.
+    # agent_id: MUST be something the agent itself declares, not something
+    # inferred from the network/auth layer. Confirmed against the original
+    # ADK implementation (truclaw_adk/guardrail.py:_root_agent_id) -- it
+    # read the developer-supplied `LlmAgent(name="...")` off the in-process
+    # agent object. There is no AWS/network equivalent of that: the IAM
+    # principal (or JWT subject) calling the Gateway identifies WHO IS
+    # AUTHENTICATING, not WHICH AGENT this is -- a fleet of agents sharing
+    # one execution role/credential (a completely normal AWS pattern) would
+    # otherwise all collapse into the same agentId, silently sharing one
+    # policy file and one audit ledger. That was a real bug in the earlier
+    # awsPrincipalArn-derived version, not just a testing artifact.
+    #
+    # Fix: the agent declares its own id per call, via MCP's standard `_meta`
+    # field on tools/call (params._meta -- see the MCP spec / mcp Python
+    # SDK's `RequestParams.Meta`, which explicitly allows arbitrary extra
+    # keys for exactly this kind of out-of-band, protocol-native metadata).
+    # This keeps the agent's identity completely separate from the tool's
+    # own argument schema -- callers pass it as
+    # `session.call_tool(name, arguments, meta={"agentId": "agentA"})`.
+    # Falls back to the IAM-principal-derived value (useful only when every
+    # agent genuinely has its own dedicated IAM identity) and then
+    # "unknown" if neither is present.
+    meta = params.get("_meta") or {}
+    declared_agent_id = meta.get("agentId") if isinstance(meta, dict) else None
+
     ctx = gateway_request.get("context") or {}
     identity = ctx.get("identity", {}) if isinstance(ctx, dict) else {}
     aws_principal_arn = identity.get("awsPrincipalArn")
     agent_id = (
-        identity.get("agentId")
+        declared_agent_id
+        or identity.get("agentId")
         or identity.get("principalId")
         or (aws_principal_arn.rsplit("/", 1)[-1] if aws_principal_arn else None)
         or "unknown"

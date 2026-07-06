@@ -60,6 +60,35 @@ TOOLS_CALL_EVENT = {
     },
 }
 
+# Same tools/call, but the caller declared its own identity via MCP's
+# standard _meta field, and the Gateway also reports an IAM principal --
+# _meta.agentId must win, since it's the agent's own declared identity, not
+# an inference from whichever credential happened to sign the request.
+TOOLS_CALL_EVENT_WITH_DECLARED_AGENT_ID = {
+    "interceptorInputVersion": "1.0",
+    "mcp": {
+        "gatewayRequest": {
+            "path": "/mcp",
+            "httpMethod": "POST",
+            "headers": {},
+            "body": {
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_email",
+                    "arguments": {"message": "hi"},
+                    "_meta": {"agentId": "agentA"},
+                },
+                "jsonrpc": "2.0",
+            },
+            "context": {
+                "identity": {"awsPrincipalArn": "arn:aws:iam::111122223333:user/shared-deploy-role"}
+            },
+        },
+        "gatewayResponse": None,
+    },
+}
+
 
 def test_non_tool_call_method_is_not_a_tool_call():
     parsed = _parse_gateway_event(REAL_INITIALIZE_EVENT)
@@ -79,6 +108,40 @@ def test_missing_mcp_key_does_not_crash():
     parsed = _parse_gateway_event({})
     assert parsed["isToolCall"] is False
     assert parsed["tool"] is None
+
+
+def test_declared_agent_id_in_meta_wins_over_iam_principal():
+    """Two different agents sharing one IAM execution role (a normal AWS
+    pattern) must NOT collapse into the same agentId. The agent's own
+    _meta.agentId is the source of truth; the IAM principal is only a
+    fallback for when no agent-declared id is present."""
+    parsed = _parse_gateway_event(TOOLS_CALL_EVENT_WITH_DECLARED_AGENT_ID)
+    assert parsed["agentId"] == "agentA"
+
+
+def test_agent_id_falls_back_to_iam_principal_when_not_declared():
+    event = {
+        "interceptorInputVersion": "1.0",
+        "mcp": {
+            "gatewayRequest": {
+                "path": "/mcp",
+                "httpMethod": "POST",
+                "headers": {},
+                "body": {
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "read", "arguments": {}},
+                    "jsonrpc": "2.0",
+                },
+                "context": {
+                    "identity": {"awsPrincipalArn": "arn:aws:iam::111122223333:user/truclaw-deploy"}
+                },
+            },
+            "gatewayResponse": None,
+        },
+    }
+    parsed = _parse_gateway_event(event)
+    assert parsed["agentId"] == "truclaw-deploy"
 
 
 def test_allow_response_echoes_original_body_via_transformed_request():
