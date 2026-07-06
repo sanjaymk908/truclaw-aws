@@ -1,12 +1,14 @@
 """
 AgentCore Gateway REQUEST interceptor — the native "before-tool-call hook".
 
-*** REMAINING VERIFICATION NEEDED ***
-The request/tool-call event shape (`_parse_gateway_event`) is now confirmed
-against a real invocation, not guessed -- see docs/ARCHITECTURE.md. One
-thing is still unverified: identity extraction (`context.identity`) has
-only been observed as null, on a non-authenticated `initialize` call -- not
-yet confirmed against a real authenticated `tools/call`.
+The request/tool-call event shape (`_parse_gateway_event`) is confirmed
+against real invocations, not guessed -- see docs/ARCHITECTURE.md. Identity
+extraction (`context.identity`) is now also confirmed against a real
+authenticated `tools/call` on the AWS_IAM test Gateway: it's
+`{"awsPrincipalArn": "arn:..."}`, not the agentId/principalId/userId/
+sessionUserId fields originally guessed (those were never observed in any
+real event). agent_id now derives from the ARN; see `_parse_gateway_event`
+for the reasoning on user_id staying separate.
 
 The response shape below was previously WRONG -- an invented
 `{"action": "ALLOW"|"DENY"}` payload that isn't AWS's actual contract at
@@ -126,14 +128,27 @@ def _parse_gateway_event(event: Dict[str, Any]) -> Dict[str, Any]:
     tool = params.get("name")
     args = params.get("arguments") or {}
 
-    # Identity: unverified against a real authenticated call yet (the one
-    # real event captured so far had context=null, since `initialize`
-    # doesn't carry caller identity). Defensive fallbacks kept so this
-    # degrades to "unknown"/"default" rather than crashing if the real
-    # shape for an authenticated tools/call turns out to differ.
+    # Identity: confirmed live against a real authenticated tools/call on the
+    # AWS_IAM test Gateway -- the actual shape is
+    #   context.identity == {"awsPrincipalArn": "arn:aws:iam::<acct>:user/<name>"}
+    # not agentId/principalId/userId/sessionUserId as originally guessed
+    # (those fields were never observed in any real event; they were an
+    # assumption carried over from the CUSTOM_JWT design before this was
+    # verified). AWS_IAM auth identifies the calling IAM principal, not a
+    # human end user -- there is no separate "who gets paged" field in it,
+    # so agent_id is derived from the ARN (falls back through the older
+    # guessed fields in case a CUSTOM_JWT gateway's shape ever differs) and
+    # user_id is left alone, since device-pairing identity is unrelated to
+    # the IAM principal invoking the Gateway.
     ctx = gateway_request.get("context") or {}
     identity = ctx.get("identity", {}) if isinstance(ctx, dict) else {}
-    agent_id = identity.get("agentId") or identity.get("principalId") or "unknown"
+    aws_principal_arn = identity.get("awsPrincipalArn")
+    agent_id = (
+        identity.get("agentId")
+        or identity.get("principalId")
+        or (aws_principal_arn.rsplit("/", 1)[-1] if aws_principal_arn else None)
+        or "unknown"
+    )
     user_id = identity.get("userId") or identity.get("sessionUserId") or "default"
 
     return {"isToolCall": True, "method": method, "tool": tool, "args": args, "agentId": agent_id, "userId": user_id, "body": body}
