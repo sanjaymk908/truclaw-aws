@@ -209,6 +209,12 @@ class TruClawStack(Stack):
         )
         state_machine.grant_start_execution(interceptor_fn)
         state_machine.grant_task_response(resume_fn)
+        # send_challenge_fn also calls SendTaskFailure directly (no-paired-
+        # device / push-delivery-failed paths in send_challenge.py) -- this
+        # grant was missing entirely, found via a live test that surfaced a
+        # real AccessDeniedException on states:SendTaskFailure rather than
+        # something caught in review.
+        state_machine.grant_task_response(send_challenge_fn)
         # grant_start_execution doesn't cover DescribeExecution/StopExecution
         # (they're scoped to execution ARNs, not the state machine ARN) --
         # the interceptor needs both for its poll loop.

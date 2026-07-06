@@ -34,7 +34,12 @@ GATEWAY_URL = "https://truclawgw-truclaw-gateway-yrcmlcuphn.gateway.bedrock-agen
 async def call_tool(token: str, tool_name: str, message: str) -> None:
     headers = {"Authorization": f"Bearer {token}"}
     print(f"\n=== Calling tool: {tool_name} ===")
-    async with streamablehttp_client(GATEWAY_URL, headers=headers) as (read, write, _):
+    # timeout=150: the dangerous-path call can legitimately take up to
+    # ~130s (CHALLENGE_TIMEOUT_SECONDS=120s + margin, see
+    # interceptor/handler.py:_escalate) while it polls Step Functions for a
+    # real device approval -- the SDK's 30s default read timeout is shorter
+    # than that and was raising httpx.ReadTimeout on a working interceptor.
+    async with streamablehttp_client(GATEWAY_URL, headers=headers, timeout=150) as (read, write, _):
         async with ClientSession(read, write) as session:
             # This is the handshake the raw curl attempt skipped.
             init_result = await session.initialize()

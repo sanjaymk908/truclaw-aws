@@ -58,6 +58,15 @@ async def call_tool(tool_name: str, message: str) -> None:
         endpoint=GATEWAY_URL,
         aws_service="bedrock-agentcore",
         aws_region=AWS_REGION,
+        # Default read timeout (30s) is shorter than the interceptor's own
+        # escalation poll deadline (CHALLENGE_TIMEOUT_SECONDS=120s + a 10s
+        # margin, see interceptor/handler.py:_escalate) -- the dangerous-path
+        # call legitimately takes up to ~130s while it waits on Step
+        # Functions for a real device approval/denial. Without this, the
+        # client's own HTTP connection times out and raises httpx.ReadTimeout
+        # well before the interceptor is done, even though the interceptor
+        # itself is working correctly. 150s gives headroom over that ~130s.
+        timeout=150,
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
             init_result = await session.initialize()
