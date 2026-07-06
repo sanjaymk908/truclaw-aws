@@ -35,6 +35,25 @@ AgentCore Gateway  --->  TruClaw
                                   every decision logged, with reason
 ```
 
+## Architecture
+
+![TruClaw on AWS — request flow and mobile approval](docs/images/architecture.png)
+
+The Interceptor Lambda is the one piece that matters most: it's AgentCore
+Gateway's REQUEST interceptor, firing on every MCP message the Gateway
+sees. For a `tools/call`, it checks the calling agent's policy (loaded from
+S3), and if the tool is dangerous, pushes a challenge to your relay and
+polls that same relay for the human's signed response — all inside that
+one Lambda invocation, no separate approval-workflow infrastructure to
+provision. The Aggregator Lambda is unrelated to any single request; it
+runs on its own hourly schedule, turning ledger events into each agent's
+`memory.md` behavioral summary. The Admin CLI isn't part of the request
+path at all — it's a human-operated tool that reads/writes the same S3
+bucket directly and drives device pairing against the relay.
+
+See `docs/ARCHITECTURE.md` for the full internals writeup, including why
+this design doesn't use Step Functions and how per-agent identity works.
+
 ## Before you start
 
 You'll need:
