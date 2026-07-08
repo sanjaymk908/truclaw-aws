@@ -20,6 +20,33 @@ from . import config
 from .logging import log
 
 
+def normalize_tool_name(tool_name: str) -> str:
+    """Strip whatever namespacing wraps the bare tool name before matching
+    it against a policy's safeTools/alwaysDangerousTools lists.
+
+    Bug found live (2026-07-08, via the truclaw-aws-samples demo's
+    calculator target): this used to be `tool_name.split(".")[-1]` only,
+    left over from the original ADK port where a tool's fully-qualified
+    name was dot-separated. AgentCore Gateway does NOT use dots -- it
+    namespaces every tool as `<targetName>___<toolName>` (triple
+    underscore, confirmed against a real `tools/list` response elsewhere
+    in this project). So `calculator___calculator` never matched
+    `"calculator"` in safeTools, and `payments___process_payment` would
+    never have matched `"process_payment"` in alwaysDangerousTools either
+    -- every single tool call, safe or dangerous, was silently falling
+    through Path 1/Path 3 straight to Path 4 (the live classifier call).
+    For alwaysDangerousTools specifically this was worse than just wasted
+    latency/cost: it meant "always" wasn't actually guaranteed -- a
+    dangerous tool's escalation depended on the classifier agreeing, not
+    on a deterministic policy match.
+
+    Splits on both separators (Gateway's `___` first, then the legacy
+    `.`) so both naming conventions keep working."""
+    name = tool_name.split("___")[-1]
+    name = name.split(".")[-1]
+    return name
+
+
 def command_from_args(tool_args: Any) -> str:
     if isinstance(tool_args, dict):
         return str(
@@ -226,7 +253,7 @@ async def check_danger(
     policy = load_policy(agent_id)
     load_usage_summary(agent_id)
 
-    normalized = tool_name.split(".")[-1]
+    normalized = normalize_tool_name(tool_name)
 
     # Path 1: safeTools bypass
     safe_set = set(policy.get("safeTools", []))
