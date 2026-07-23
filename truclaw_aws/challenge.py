@@ -130,14 +130,57 @@ async def _send_and_poll(
                         return {"approved": False, "reason": verified.get("error")}
 
                     claims = verified.get("claims", {})
-                    if claims.get("isHuman") is False:
-                        return {"approved": False, "reason": "JWT isHuman=false"}
+
+                    # The raw signed JWT (not just its decoded claims) is
+                    # carried through in the returned dict below so
+                    # interceptor/handler.py's append_event() can persist it
+                    # to the S3 ledger alongside the decoded claims. Flagged
+                    # live (2026-07-23): decoded claims alone are only as
+                    # trustworthy as whatever wrote the ledger entry: they
+                    # can't be independently re-verified later against the
+                    # paired device's public key (stored in pairing.py's
+                    # device registry). Retaining the actual signed artifact
+                    # turns "an audit log" into non-repudiable proof of what
+                    # the device actually signed -- the whole point of using
+                    # a signed challenge/response scheme in the first place.
+                    # Only done for signature-verified JWTs (this branch);
+                    # a JWT that failed verify_jwt() isn't proof of anything
+                    # from the device and isn't retained.
+
+                    # Approval requires BOTH isHuman and isAbove21 to be
+                    # explicitly True -- fail-closed, not just "not False".
+                    # isAbove21 doubles as this demo's explicit approve/deny
+                    # signal, not just an age claim -- confirmed directly by
+                    # the paired device's owner (2026-07-22, Task #22 live
+                    # testing). Found the hard way: a "denied" approval on
+                    # the device still came back with a validly-signed,
+                    # isHuman=true JWT and the payment went through anyway,
+                    # because this code only ever checked isHuman (and even
+                    # that check was permissive -- `is False` rather than
+                    # `is True`, so a missing/null claim would have silently
+                    # passed too). Added a temporary diagnostic log of the
+                    # raw poll response (`{"jwt":..., "sessionId":...,
+                    # "receivedAt":...}` -- confirmed no separate decision
+                    # field exists in the relay's poll contract itself)
+                    # before finding out the decision is encoded in this
+                    # specific JWT claim instead. A real (non-demo)
+                    # deployment would presumably use a dedicated
+                    # `approved`/`decision` claim instead of overloading an
+                    # age-verification field, but this repo follows the
+                    # demo's actual wire format rather than inventing a
+                    # cleaner one that wouldn't match what the paired device
+                    # actually sends.
+                    if claims.get("isHuman") is not True:
+                        return {"approved": False, "reason": "JWT isHuman not true", "jwt": jwt}
+                    if claims.get("isAbove21") is not True:
+                        return {"approved": False, "reason": "denied (isAbove21 not true)", "jwt": jwt}
 
                     log(f"[challenge] approved challengeSessionId={challenge_session_id}")
                     return {
                         "approved": True,
                         "claims": claims,
                         "sessionId": verified.get("sessionId"),
+                        "jwt": jwt,
                     }
                 elif poll_resp.status_code == 404:
                     log(f"[challenge] poll 404 challengeSessionId={challenge_session_id}")
