@@ -295,7 +295,18 @@ async def check_danger(
     # Path 3: alwaysDangerousTools
     dangerous_set = set(policy.get("alwaysDangerousTools", []))
     if normalized in dangerous_set or tool_name in dangerous_set:
-        action = await get_action_description(tool_name, tool_args, script.get("scriptContent"))
+        # Pass the NORMALIZED name, not the raw Gateway-namespaced one --
+        # found live via the OWASP Agentic Top 10 test suite (ASI09: Human-
+        # Agent Trust Exploitation), confirmed against a real push
+        # notification earlier during Task #22: the human's paired-device
+        # prompt showed the raw string "payments___process_payment" instead
+        # of a readable name, because get_action_description()'s fallback
+        # (`f"Approve: {tool_name}"`, used whenever GOOGLE_API_KEY is unset
+        # or the classifier call fails) and its Gemini prompt both echo
+        # back whatever tool_name they're given verbatim. An unreadable
+        # approval prompt is itself a vulnerability -- a human can't
+        # meaningfully consent to something they can't parse.
+        action = await get_action_description(normalized, tool_args, script.get("scriptContent"))
         return {
             "dangerous": True,
             "reason": "always-dangerous tool",
